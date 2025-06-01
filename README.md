@@ -92,7 +92,7 @@ If you use this code in your research, please cite:
 ```bibtex
 @article{oaml2024,
   title={OAML: Occlusion-Aware Metric Learning for Face Recognition},
-  author={[Your Name]},
+  author={Adam Ibrahim, Shengcia Liao},
   journal={[Journal/Conference]},
   year={2024}
 }
@@ -107,12 +107,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Based on AdaFace: [https://github.com/mk-minchul/AdaFace](https://github.com/mk-minchul/AdaFace)
 - QAConv implementation inspired by: [https://github.com/scliao/QAConv](https://github.com/scliao/QAConv)
 
-```angular2html
-@inproceedings{kim2022adaface,
-  title={AdaFace: Quality Adaptive Margin for Face Recognition},
-  author={Kim, Minchul and Jain, Anil K and Liu, Xiaoming},
-  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
-  year={2022}
-}
-```
 
