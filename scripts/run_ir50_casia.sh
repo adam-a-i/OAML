@@ -1,0 +1,19 @@
+python main.py \
+    --data_root /home/maass/code \
+    --train_data_path "CASIA-webface converted" \
+    --val_data_path "CASIA-webface converted" \
+    --prefix ir50_casia_adaface_partial \
+    --gpus 1 \
+    --use_16bit \
+    --arch ir_50 \
+    --batch_size 256 \
+    --num_workers 8 \
+    --epochs 28 \
+    --lr_milestones 14,22,26 \
+    --lr 0.1 \
+    --head adaface \
+    --m 0.4 \
+    --h 0.333 \
+    --low_res_augmentation_prob 0.2 \
+    --crop_augmentation_prob 0.2 \
+    --photometric_augmentation_prob 0.2 
