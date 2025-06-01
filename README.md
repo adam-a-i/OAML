@@ -1,10 +1,99 @@
-# AdaFace: Quality Adaptive Margin for Face Recognition
+# OAML: Occlusion-Aware Metric Learning for Face Recognition
 
-Official github repository for AdaFace: Quality Adaptive Margin for Face Recognition. 
-The paper (https://arxiv.org/abs/2204.00964) is presented in CVPR 2022 (Oral). 
+OAML is a robust face recognition framework that combines AdaFace with QAConv to achieve state-of-the-art performance, especially under challenging conditions like occlusions and low-quality images.
 
+## Key Features
 
-> Abstract: Recognition in low quality face datasets is challenging because facial attributes are obscured and degraded. Advances in margin-based loss functions have resulted in enhanced discriminability of faces in the embedding space. Further, previous studies have studied the effect of adaptive losses to assign more importance to misclassified (hard) examples. In this work, we introduce another aspect of adaptiveness in the loss function, namely the image quality. We argue that the strategy to emphasize misclassified samples should be adjusted according to their image quality. Specifically, the relative importance of easy and hard samples should be based on the sample's image quality. We propose a new loss function that emphasizes samples of different difficulty based on their image quality. Our method achieves this in the form of an adaptive margin function by approximating the image quality with feature norms. Extensive experiments show that our method, AdaFace, improves the face recognition performance over the state-of-the-art (SoTA) on four datasets (IJB-B, IJB-C, IJB-S and TinyFace).
+- **Occlusion-Aware Training**: Implements medical mask occlusion simulation for robust face recognition
+- **Dual Metric Learning**: Combines AdaFace and QAConv for improved feature learning
+- **Flexible Loss Functions**: Supports pairwise matching loss and triplet loss
+- **PK Sampling**: Implements identity-aware batch sampling for effective metric learning
+- **Comprehensive Evaluation**: Supports multiple face recognition benchmarks
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+## Project Structure
+
+```
+OAML/
+├── dataset/              # Dataset handling code
+├── face_alignment/       # Face alignment utilities
+├── assets/              # Model weights and resources
+├── scripts/             # Utility scripts
+├── validation_*/        # Validation datasets
+├── data.py             # Data loading and preprocessing
+├── net.py              # Network architecture
+├── qaconv.py           # QAConv implementation
+├── transforms.py        # Data augmentation transforms
+├── train_val.py        # Training and validation logic
+├── main.py             # Training entry point
+├── main_eval.py        # Evaluation entry point
+└── requirements.txt     # Project dependencies
+```
+
+## Usage
+
+### Training
+
+```bash
+python main.py --data_root /path/to/data --train_data_path faces_emore --val_data_path faces_emore
+```
+
+### Evaluation
+
+```bash
+python main_eval.py --model-path /path/to/model --data-path /path/to/test/data
+```
+
+## Key Components
+
+### Medical Mask Occlusion
+The `MedicalMaskOcclusion` transform simulates face occlusions using medical masks, helping the model learn robust features against partial occlusions. Features include:
+- Random mask positioning and scaling
+- Configurable occlusion probability
+- Standard reference points for CASIA WebFace alignment
+
+### QAConv Integration
+QAConv is integrated with AdaFace to provide complementary feature learning:
+- AdaFace: Handles general face recognition
+- QAConv: Specializes in handling occlusions and challenging cases
+- Combined loss function for optimal performance
+
+### Loss Functions
+- AdaFace Loss: Primary classification loss
+- QAConv Pairwise Loss: Handles pair-wise matching
+- QAConv Triplet Loss: Enforces metric learning constraints
+
+### PK Sampling
+- Implements identity-aware batch sampling
+- Ensures multiple examples per identity in each batch
+- Optimized for metric learning objectives
+
+## Citation
+
+If you use this code in your research, please cite:
+
+```bibtex
+@article{oaml2024,
+  title={OAML: Occlusion-Aware Metric Learning for Face Recognition},
+  author={[Your Name]},
+  journal={[Journal/Conference]},
+  year={2024}
+}
+```
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+
+- Based on AdaFace: [https://github.com/mk-minchul/AdaFace](https://github.com/mk-minchul/AdaFace)
+- QAConv implementation inspired by: [https://github.com/scliao/QAConv](https://github.com/scliao/QAConv)
 
 ```angular2html
 @inproceedings{kim2022adaface,
