@@ -14,21 +14,19 @@ import wandb
 import os
 from torchvision import transforms
 from softmax_triplet_loss import SoftmaxTripletLoss
+# Import TransMatcher components directly to avoid module overwriting
+from transmatcher import TransMatcher, TransformerDecoder, TransformerDecoderLayer
 
+__all__ = ['Trainer']  # Explicitly declare what should be exposed
 
 class Trainer(LightningModule):
     def __init__(self, **kwargs):
         super(Trainer, self).__init__()
         self.save_hyperparameters()  # sets self.hparams
         
-        # Define weight variables before wandb initialization
-        # weight for qaconv loss 
-        self.qaconv_loss_weight = 0.9  
-        self.adaface_loss_weight = 1.0 - self.qaconv_loss_weight  
-        
-        #weights for combining AdaFace and QAConv scores during evaluation
-        self.adaface_eval_weight = 0.5  
-        self.qaconv_eval_weight = 0.5   
+        # Define weight variables for AdaFace and TransMatcher loss
+        self.adaface_loss_weight = 0.1
+        self.transmatcher_loss_weight = 0.9
         
         # Initialize wandb
         wandb.init(
@@ -37,14 +35,11 @@ class Trainer(LightningModule):
                     "architecture": self.hparams.arch,
                     "learning_rate": self.hparams.lr,
                     "head_type": self.hparams.head,
-                    "qaconv_loss_weight": self.qaconv_loss_weight,
                     "adaface_loss_weight": self.adaface_loss_weight,
-                    "adaface_eval_weight": self.adaface_eval_weight,
-                    "qaconv_eval_weight": self.qaconv_eval_weight,
-                "epochs": self.hparams.epochs if hasattr(self.hparams, 'epochs') else None,
-                "batch_size": self.hparams.batch_size if hasattr(self.hparams, 'batch_size') else None,
-                "k_nearest": self.hparams.k_nearest if hasattr(self.hparams, 'k_nearest') else None,
-            }
+                    "transmatcher_loss_weight": self.transmatcher_loss_weight,
+                    "epochs": self.hparams.epochs if hasattr(self.hparams, 'epochs') else None,
+                    "batch_size": self.hparams.batch_size if hasattr(self.hparams, 'batch_size') else None,
+                }
         )
 
         self.class_num = utils.get_num_class(self.hparams)
@@ -61,36 +56,6 @@ class Trainer(LightningModule):
                                      )
 
         self.cross_entropy_loss = CrossEntropyLoss()
-        
-        # Initialize QAConv with class_num for classification mode
-        if hasattr(self.model, 'qaconv'):
-            self.qaconv = self.model.qaconv
-            # Update QAConv to include class_num and k_nearest
-            num_features = self.qaconv.num_features
-            height = self.qaconv.height
-            width = self.qaconv.width
-            self.qaconv = type(self.qaconv)(num_features, height, width, 
-                                          num_classes=self.class_num,
-                                          k_nearest=self.hparams.k_nearest)  # Add k_nearest from hparams
-            self.model.qaconv = self.qaconv
-            # Initialize pairwise matching loss with qaconv matcher
-            self.qaconv_criterion = PairwiseMatchingLoss(
-                self.qaconv
-            )
-            # Initialize SoftmaxTripletLoss with qaconv matcher
-            # We will use the triplet_loss output from this criterion
-            self.qaconv_triplet_criterion = SoftmaxTripletLoss(
-                matcher=self.qaconv, 
-                margin=1.0, # Hardcoded margin for triplet loss
-                triplet_weight=0.5 # Set triplet weight to 0.5
-            )
-        else:
-            print("Warning: Model does not have QAConv layer")
-            self.qaconv = None
-            self.qaconv_criterion = None
-
-        print(f'Loss weights - AdaFace: {self.adaface_loss_weight}, QAConv: {self.qaconv_loss_weight}')
-        print(f'Evaluation weights - AdaFace: {self.adaface_eval_weight}, QAConv: {self.qaconv_eval_weight}')
 
         if self.hparams.start_from_model_statedict:
             ckpt = torch.load(self.hparams.start_from_model_statedict)
@@ -132,6 +97,9 @@ class Trainer(LightningModule):
 
     def training_step(self, batch, batch_idx):
         images, labels = batch
+        
+        # Create TransMatcher loss here instead of in __init__
+        transmatcher_loss = PairwiseMatchingLoss(self.model.transmatcher)
         
         # --- Save sample augmented images in the first epoch ---
         if self.current_epoch == 0 and batch_idx < 3: # Save 3 sample batches
@@ -177,111 +145,38 @@ class Trainer(LightningModule):
             # Add small epsilon to non-zero values to prevent division issues
             x = x + 1e-8 * (x.abs() > 0).float()
             
-        # normalize feature maps for qaconv
-        x_norm = torch.norm(x.view(x.size(0), -1), p=2, dim=1, keepdim=True).view(x.size(0), 1, 1, 1)
-        # Prevent division by zero
-        x_norm = torch.clamp(x_norm, min=1e-8)
-        feature_maps = x / x_norm
-        
-        # Make deep copy of feature maps to avoid inference tensor issues
-        feature_maps = feature_maps.clone().detach().requires_grad_(True)
-        
-        # Verify normalization
-        norms = torch.norm(feature_maps.view(feature_maps.size(0), -1), p=2, dim=1)
-        if ((norms < 0.99) | (norms > 1.01)).any():
-            print(f"WARNING: Feature maps not properly normalized. Min norm: {norms.min().item()}, Max norm: {norms.max().item()}")
-            # Force normalization again with safety measures
-            feature_maps = F.normalize(feature_maps, p=2, dim=1).clone().detach().requires_grad_(True)
-        
         # get adaface embeddings through output layer
         embeddings = self.model.output_layer(x)
-        
         # Check for NaNs in embeddings
         if torch.isnan(embeddings).any():
             print(f"WARNING: Embeddings contain NaNs. Replacing with zeros.")
             embeddings = torch.nan_to_num(embeddings, nan=0.0)
-            
         embeddings, norms = utils.l2_norm(embeddings, axis=1)
-        
         # get adaface loss
         cos_thetas = self.head(embeddings, norms, labels)
         if isinstance(cos_thetas, tuple):
             cos_thetas, bad_grad = cos_thetas
             labels[bad_grad.squeeze(-1)] = -100  # ignore_index
         adaface_loss = self.cross_entropy_loss(cos_thetas, labels)
-        
-        # Initialize qaconv_loss for wandb logging
-        qaconv_loss = torch.tensor(0.0, device=device)
-        qaconv_acc = torch.tensor(0.0, device=device)
-
-        # get qaconv pairwise matching loss if available
-        if self.qaconv_criterion is not None:
-            # Make sure qaconv is on the right device
-            if hasattr(self, 'qaconv'):
-                self.qaconv = self.qaconv.to(device)
-            
-            # Get loss and accuracy from pairwise matching loss
-            pairwise_loss, pairwise_acc = self.qaconv_criterion(feature_maps, labels)
-            
-            # Get triplet loss from SoftmaxTripletLoss criterion
-            # Note: We only use the triplet_loss output here
-            cls_loss, triplet_loss, _, cls_acc, triplet_acc = self.qaconv_triplet_criterion(feature_maps, labels)
-
-            # --- Debugging NaN in individual QAConv losses ---
-            if torch.isnan(pairwise_loss).any() or torch.isinf(pairwise_loss).any():
-                 print(f"DEBUG: Pairwise loss contains NaN or Inf at epoch {self.current_epoch}, batch {batch_idx}!")
-            if torch.isnan(triplet_loss).any() or torch.isinf(triplet_loss).any():
-                 print(f"DEBUG: Triplet loss contains NaN or Inf at epoch {self.current_epoch}, batch {batch_idx}!")
-            # --- End Debugging ---
-
-            # --- Debugging QAConv loss stuck at 0 (keep existing check) ---
-            if self.current_epoch > 0 and self.qaconv_loss_weight > 0 and (torch.isnan(pairwise_loss).any() or torch.isinf(pairwise_loss).any() or torch.isnan(triplet_loss).any() or torch.isinf(triplet_loss).any()):
-                 # The loss will become NaN and then might be converted to 0 by the system
-                 print(f"DEBUG: QAConv combined loss is becoming NaN due to component NaNs/Infs at epoch {self.current_epoch}, batch {batch_idx}!")
-            # --- End Debugging ---
-
-            # Log QAConv metrics to pytorch lightning
-            # You might want to log both pairwise and triplet accuracies
-            self.log('qaconv_pairwise_acc', pairwise_acc.mean(), on_step=True, on_epoch=True, logger=True)
-            self.log('qaconv_triplet_acc', triplet_acc.mean(), on_step=True, on_epoch=True, logger=True)
-            
-            # Combine pairwise and triplet losses for the total QAConv loss
-            # Use the qaconv_loss_weight defined in __init__ for the combined loss
-            qaconv_loss = pairwise_loss.mean() + self.qaconv_triplet_criterion.triplet_weight * triplet_loss.mean()
-            
-            # Check for NaN in losses
-            if torch.isnan(qaconv_loss):
-                print(f"WARNING: QAConv loss is NaN. Using zero loss instead.")
-                qaconv_loss = torch.tensor(0.0, device=device)
-                
-            if torch.isnan(adaface_loss):
-                print(f"WARNING: AdaFace loss is NaN. Using zero loss instead.")
-                adaface_loss = torch.tensor(0.0, device=device)
-            
-            # Combine losses
-            total_loss = self.adaface_loss_weight * adaface_loss + self.qaconv_loss_weight * qaconv_loss
-        else:
-            total_loss = adaface_loss
-
-        # log metrics - ensure we take mean of tensor values
+        # --- TransMatcher Pairwise Matching Loss ---
+        # Extract feature maps for TransMatcher: [B, C, H, W] -> [B, H, W, C]
+        feature_maps = x.permute(0, 2, 3, 1).contiguous()
+        transmatcher_loss_val, transmatcher_acc = transmatcher_loss(feature_maps, labels)
+        total_loss = self.adaface_loss_weight * adaface_loss + self.transmatcher_loss_weight * transmatcher_loss_val.mean()
+        # log metrics
         lr = self.get_current_lr()
         self.log('lr', lr, on_step=True, on_epoch=True, logger=True)
         self.log('train_loss', total_loss.mean(), on_step=True, on_epoch=True, logger=True, prog_bar=True)
         self.log('adaface_loss', adaface_loss.mean(), on_step=True, on_epoch=True, logger=True, prog_bar=True)
-        self.log('qaconv_loss', qaconv_loss, on_step=True, on_epoch=True, logger=True, prog_bar=True)
-        self.log('qaconv_acc', pairwise_acc.mean(), on_step=True, on_epoch=True, logger=True)
-        
-        # Log to wandb
+        self.log('transmatcher_loss', transmatcher_loss_val.mean(), on_step=True, on_epoch=True, logger=True, prog_bar=True)
+        self.log('transmatcher_acc', transmatcher_acc.mean(), on_step=True, on_epoch=True, logger=True, prog_bar=True)
         wandb.log({
-            "qaconv_loss": qaconv_loss.item(),
-            "qaconv_acc": pairwise_acc.mean().item(),
             "adaface_loss": adaface_loss.item(),
+            "transmatcher_loss": transmatcher_loss_val.mean().item(),
+            "transmatcher_acc": transmatcher_acc.mean().item(),
             "total_loss": total_loss.mean().item(),
             "learning_rate": lr,
-            "qaconv_pairwise_loss": pairwise_loss.mean().item(), # Log pairwise loss to wandb
-            "qaconv_triplet_loss": triplet_loss.mean().item(), # Log triplet loss to wandb
         })
-
         return total_loss.mean()
 
     def training_epoch_end(self, outputs):
@@ -301,16 +196,20 @@ class Trainer(LightningModule):
         # get features from model up to before output layer
         with torch.no_grad():  # Ensure we don't track gradients
             # Extract feature maps directly from the model's input layer and body
-            # This is more reliable than trying to get intermediate outputs
             x = self.model.input_layer(images)
-            
-            # Process through body layers
             for layer in self.model.body:
                 x = layer(x)
             
-            # At this point, x contains the feature maps needed for QAConv
-            # Normalize these feature maps
-            feature_maps = F.normalize(x, p=2, dim=1)
+            # Ensure feature maps are properly shaped for TransMatcher
+            # TransMatcher expects [B, H, W, C] format where H*W = seq_len
+            B, C, H, W = x.shape
+            
+            # Keep in [B, H, W, C] format that TransMatcher expects
+            feature_maps = x.permute(0, 2, 3, 1).contiguous()  # [B, H, W, C]
+            
+            # Verify dimensions match TransMatcher's expectations
+            assert H * W == self.model.transmatcher.seq_len, f"H*W ({H*W}) != seq_len ({self.model.transmatcher.seq_len})"
+            assert C == self.model.transmatcher.d_model, f"C ({C}) != d_model ({self.model.transmatcher.d_model})"
             
             # get adaface embeddings with flip augmentation
             embeddings, norms = self.model(images)
@@ -324,19 +223,16 @@ class Trainer(LightningModule):
             if torch.isnan(embeddings).any():
                 print(f"WARNING: AdaFace embeddings contain NaNs. Replacing with zeros.")
                 embeddings = torch.nan_to_num(embeddings, nan=0.0)
-            
             if torch.isnan(feature_maps).any():
-                print(f"WARNING: QAConv feature maps contain NaNs. Replacing with zeros.")
+                print(f"WARNING: TransMatcher feature maps contain NaNs. Replacing with zeros.")
                 feature_maps = torch.nan_to_num(feature_maps, nan=0.0)
-                # Force normalization again
-                feature_maps = F.normalize(feature_maps, p=2, dim=1)
-
+            
         if self.hparams.distributed_backend == 'ddp':
             # to save gpu memory
             return {
                 'adaface_output': embeddings.to('cpu'),
                 'norm': norms.to('cpu'),
-                'qaconv_output': feature_maps.to('cpu'),
+                'transmatcher_output': feature_maps.to('cpu'),
                 'target': labels.to('cpu'),
                 'dataname': dataname.to('cpu'),
                 'image_index': image_index.to('cpu')
@@ -346,709 +242,286 @@ class Trainer(LightningModule):
             return {
                 'adaface_output': embeddings,
                 'norm': norms,
-                'qaconv_output': feature_maps,
+                'transmatcher_output': feature_maps,
                 'target': labels,
                 'dataname': dataname,
                 'image_index': image_index
             }
 
     def validation_epoch_end(self, outputs):
-        all_adaface_tensor, all_norm_tensor, all_qaconv_tensor, all_target_tensor, all_dataname_tensor = self.gather_outputs(outputs)
-
+        all_adaface_tensor, all_norm_tensor, all_transmatcher_tensor, all_target_tensor, all_dataname_tensor = self.gather_outputs(outputs)
         dataname_to_idx = {"agedb_30": 0, "cfp_fp": 1, "lfw": 2, "cplfw": 3, "calfw": 4}
         idx_to_dataname = {val: key for key, val in dataname_to_idx.items()}
         val_logs = {}
-        
-        # Weight parameter for combining adaface and qaconv scores
-        adaface_weight = self.adaface_eval_weight  # Use class parameter instead of hardcoded value
-        qaconv_weight = self.qaconv_eval_weight    # Use class parameter instead of hardcoded value
-        
+        adaface_accs = []
+        transmatcher_accs = []
+        combined_accs = []
         for dataname_idx in all_dataname_tensor.unique():
             dataname = idx_to_dataname[dataname_idx.item()]
-            
-            # get data for this dataset
             mask = all_dataname_tensor == dataname_idx
             adaface_embeddings = all_adaface_tensor[mask].cpu().numpy()
-            qaconv_features = all_qaconv_tensor[mask]
+            transmatcher_features = all_transmatcher_tensor[mask]
             labels = all_target_tensor[mask].cpu().numpy()
-            issame = labels[0::2]  # Original issame labels for the pairs
-            
             print(f"\nProcessing {dataname} with {len(adaface_embeddings)} samples")
             
-            # evaluate adaface embeddings
-            tpr, fpr, accuracy, best_thresholds = evaluate_utils.evaluate(adaface_embeddings, issame, nrof_folds=10)
-            adaface_acc = accuracy.mean()
+            # --- AdaFace Similarity Matrix ---
+            adaface_emb = torch.tensor(adaface_embeddings)
+            adaface_emb = torch.nn.functional.normalize(adaface_emb, p=2, dim=1)
+            adaface_sim = torch.matmul(adaface_emb, adaface_emb.t()).cpu().numpy()
+            
+            # --- TransMatcher Similarity Matrix ---
+            N = transmatcher_features.shape[0]
+            transmatcher_sim_tensor = torch.zeros((N, N), dtype=transmatcher_features.dtype, device=transmatcher_features.device)
+            batch_size = 256
+            with torch.no_grad():
+                for i in range(0, N, batch_size):
+                    end_i = min(i + batch_size, N)
+                    query_batch = transmatcher_features[i:end_i]
+                    for j in range(0, N, batch_size):
+                        end_j = min(j + batch_size, N)
+                        gallery_batch = transmatcher_features[j:end_j]
+                        scores = self.model.transmatcher(query_batch, gallery_batch)
+                        transmatcher_sim_tensor[i:end_i, j:end_j] = scores
+            transmatcher_sim = transmatcher_sim_tensor.cpu().numpy()
+            
+            # --- Normalize similarity matrices to [0, 1] ---
+            adaface_sim_norm = (adaface_sim - adaface_sim.min()) / (adaface_sim.max() - adaface_sim.min() + 1e-8)
+            transmatcher_sim_norm = (transmatcher_sim - transmatcher_sim.min()) / (transmatcher_sim.max() - transmatcher_sim.min() + 1e-8)
+            
+            # --- Combined Similarity Matrix ---
+            combined_sim = self.adaface_loss_weight * adaface_sim_norm + self.transmatcher_loss_weight * transmatcher_sim_norm
+            
+            # --- Compute accuracy for each method ---
+            n = len(labels)
+            pids = labels
+            label_matrix = pids[:, None] == pids[None, :]
+            
+            # Get upper triangle indices (excluding diagonal)
+            indices = np.triu_indices(n, k=1)
+            issame_pairs = label_matrix[indices]
+            
+            # Get scores for all pairs
+            adaface_scores = adaface_sim[indices]
+            transmatcher_scores = transmatcher_sim[indices]
+            combined_scores = combined_sim[indices]
+            
+            # Calculate accuracy using ROC curve
+            def calculate_accuracy(scores, issame):
+                # Get thresholds
+                thresholds = np.arange(0, 1, 0.01)
+                accuracies = []
+                
+                for threshold in thresholds:
+                    # Calculate true positives and true negatives
+                    tp = np.sum((scores[issame] > threshold))
+                    tn = np.sum((scores[~issame] <= threshold))
+                    
+                    # Calculate accuracy
+                    accuracy = (tp + tn) / len(scores)
+                    accuracies.append(accuracy)
+                
+                # Return best accuracy
+                return np.max(accuracies)
+            
+            # Calculate accuracies
+            adaface_acc = calculate_accuracy(adaface_scores, issame_pairs)
+            transmatcher_acc = calculate_accuracy(transmatcher_scores, issame_pairs)
+            combined_acc = calculate_accuracy(combined_scores, issame_pairs)
+            
             val_logs[f'{dataname}_adaface_acc'] = adaface_acc
+            adaface_accs.append(adaface_acc)
+            val_logs[f'{dataname}_transmatcher_acc'] = transmatcher_acc
+            transmatcher_accs.append(transmatcher_acc)
+            val_logs[f'{dataname}_combined_acc'] = combined_acc
+            combined_accs.append(combined_acc)
+            
             print(f"{dataname} AdaFace accuracy: {adaface_acc:.4f}")
-            
-            # Structure data for gallery-query pairs following the original repo approach
-            # Each consecutive pair of images forms a gallery-query pair
-            gallery_features = qaconv_features[0::2]  # Even indices (0, 2, 4...)
-            query_features = qaconv_features[1::2]    # Odd indices (1, 3, 5...)
-            
-            if len(gallery_features) == len(query_features) and len(gallery_features) > 0:
-                try:
-                    # Make sure QAConv is on the right device
-                    device = query_features.device
-                    if hasattr(self, 'qaconv'):
-                        self.qaconv = self.qaconv.to(device)
-                    
-                    num_pairs = len(gallery_features)
-                    print(f"Computing scores for {num_pairs} gallery-query pairs")
-                    
-                    # Verify inputs are properly normalized
-                    q_norms = torch.norm(query_features.view(query_features.size(0), -1), p=2, dim=1)
-                    g_norms = torch.norm(gallery_features.view(gallery_features.size(0), -1), p=2, dim=1)
-                    
-                    if (q_norms < 0.99).any() or (q_norms > 1.01).any():
-                        print(f"WARNING: Query features not properly normalized. Min: {q_norms.min().item():.4f}, Max: {q_norms.max().item():.4f}")
-                        query_features = F.normalize(query_features, p=2, dim=1)
-                    
-                    if (g_norms < 0.99).any() or (g_norms > 1.01).any():
-                        print(f"WARNING: Gallery features not properly normalized. Min: {g_norms.min().item():.4f}, Max: {g_norms.max().item():.4f}")
-                        gallery_features = F.normalize(gallery_features, p=2, dim=1)
-                    
-                    with torch.no_grad():
-                        # Compute scores for matching pairs (direct matches)
-                        positive_scores = self.qaconv.match_pairs(query_features, gallery_features)
-                    
-                        # Sample negative pairs (non-matching identities)
-                        # For efficiency, we'll sample a number of negative pairs equal to the positive pairs
-                        np.random.seed(42)  # For reproducibility
-                        
-                        # Initialize negative scores tensor
-                        negative_scores = torch.zeros(num_pairs, device=device)
-                        
-                        # Create a batch of random indices for non-matching pairs
-                        # Use a more structured approach - shift indices by half the dataset size
-                        # This ensures gallery-query pairs with definitely different identities
-                        half_size = num_pairs // 2
-                        
-                        for i in range(0, num_pairs, 32):  # Process in batches of 32 for efficiency
-                            end_idx = min(i + 32, num_pairs)
-                            batch_size = end_idx - i
-                            
-                            # For each gallery feature, pick a query feature from a different identity
-                            # by shifting the index by half the dataset size
-                            random_indices = np.zeros(batch_size, dtype=np.int64)
-                            
-                            for j in range(batch_size):
-                                # Shift by half the dataset to get truly different identity
-                                idx = (i + j + half_size) % num_pairs
-                                random_indices[j] = idx
-                            
-                            # Gather the random query features
-                            selected_queries = query_features[random_indices]
-                            batch_galleries = gallery_features[i:end_idx]
-                            
-                            # Compute scores for these negative pairs
-                            for j in range(batch_size):
-                                # Get scores for each gallery with its selected non-matching query
-                                score = self.qaconv(batch_galleries[j:j+1], selected_queries[j:j+1])
-                                negative_scores[i + j] = score.view(-1)[0]
-                    
-                        # Combine positive and negative scores and create labels
-                        all_scores = torch.cat([positive_scores, negative_scores])
-                        all_labels = torch.cat([
-                            torch.ones(num_pairs, device=device),   # Positive pairs are 1 (same identity)
-                            torch.zeros(num_pairs, device=device)   # Negative pairs are 0 (different identity)
-                        ])
-                        
-                        # Check for NaN values
-                        if torch.isnan(all_scores).any():
-                            print("WARNING: QAConv scores contain NaN values. Replacing with zeros.")
-                            all_scores = torch.nan_to_num(all_scores, nan=0.0)
-                    
-                    # Move to CPU for numpy conversion
-                    qaconv_scores = all_scores.cpu().numpy()
-                    pair_labels = all_labels.cpu().numpy().astype(bool)
-                    
-                    # Print score stats for debugging
-                    pos_scores = qaconv_scores[:num_pairs]
-                    neg_scores = qaconv_scores[num_pairs:]
-                    print(f"QAConv positive scores - min: {np.min(pos_scores):.4f}, max: {np.max(pos_scores):.4f}")
-                    print(f"QAConv negative scores - min: {np.min(neg_scores):.4f}, max: {np.max(neg_scores):.4f}")
-                    
-                    # Check if scores are inverted (negative pairs getting higher scores than positive pairs)
-                    pos_mean = np.mean(pos_scores)
-                    neg_mean = np.mean(neg_scores)
-                    print(f"QAConv score means - positive: {pos_mean:.4f}, negative: {neg_mean:.4f}")
-                    
-                    # If scores are inverted (negative pairs getting higher scores), flip the labels
-                    labels_flipped = False
-                    if neg_mean > pos_mean:
-                        print("WARNING: QAConv scores appear to be inverted (negative pairs have higher scores). Flipping labels.")
-                        # Invert the labels (0 becomes 1, 1 becomes 0)
-                        pair_labels = ~pair_labels
-                        labels_flipped = True
-                    
-                    # Check if scores are extremely large, which might cause numerical issues
-                    if pos_mean > 100 or neg_mean > 100:
-                        print(f"WARNING: QAConv scores are extremely large (pos_mean: {pos_mean:.4f}, neg_mean: {neg_mean:.4f}). Normalizing...")
-                        # Normalize scores to have mean of 0 and standard deviation of 1
-                        all_mean = np.mean(qaconv_scores)
-                        all_std = np.std(qaconv_scores)
-                    
-                        # Prevent division by zero
-                        if all_std < 1e-8:
-                            all_std = 1.0
-                            
-                        qaconv_scores = (qaconv_scores - all_mean) / all_std
-                        # Re-compute positive and negative scores after normalization
-                        pos_scores = qaconv_scores[:num_pairs]
-                        neg_scores = qaconv_scores[num_pairs:]
-                        print(f"After normalization - Positive: {np.mean(pos_scores):.4f}, Negative: {np.mean(neg_scores):.4f}")
-                    
-                    # For ROC calculation, we need distances (smaller = more similar)
-                    # For QAConv scores, higher = more similar, so negate them to get distances
-                    qaconv_dists = -qaconv_scores
-                    
-                    # For highly reliable classification, ensure pos and neg are well separated
-                    # Compute separation margin between positive and negative
-                    qaconv_pos_dists = qaconv_dists[:num_pairs]
-                    qaconv_neg_dists = qaconv_dists[num_pairs:]
-                    
-                    # Calculate direct accuracy by comparing each sample to the average of the other class
-                    direct_correct = 0
-                    for i in range(num_pairs):
-                        if qaconv_pos_dists[i] < np.mean(qaconv_neg_dists):
-                            direct_correct += 1
-                    for i in range(num_pairs):
-                        if qaconv_neg_dists[i] > np.mean(qaconv_pos_dists):
-                            direct_correct += 1
-                    direct_qaconv_acc = direct_correct / (2 * num_pairs)
-                    
-                    # Log the direct accuracy as the primary QAConv metric
-                    val_logs[f'{dataname}_qaconv_acc'] = direct_qaconv_acc
-                    print(f"{dataname} QAConv accuracy: {direct_qaconv_acc:.4f}")
-                    
-                except Exception as e:
-                    import traceback
-                    print(f"WARNING: Error during QAConv matching: {e}")
-                    print(traceback.format_exc())
-                    # Fallback: create dummy scores
-                    qaconv_scores = np.zeros(2 * len(gallery_features))
-                    direct_qaconv_acc = 0.0
-                    val_logs[f'{dataname}_qaconv_acc'] = direct_qaconv_acc
-                    continue
-                
-                # Calculate AdaFace distances for each pair
-                adaface_embeddings1 = adaface_embeddings[0::2]  # gallery
-                adaface_embeddings2 = adaface_embeddings[1::2]  # query
-                adaface_dists = np.zeros(len(adaface_embeddings1))
-                
-                for i in range(len(adaface_embeddings1)):
-                    diff = adaface_embeddings1[i] - adaface_embeddings2[i]
-                    adaface_dists[i] = np.sum(np.square(diff))
-                
-                # For combined evaluation, we need to select only the positive pair scores from QAConv
-                # since we don't have negative pair scores for AdaFace in the same format
-                qaconv_positive_dists = qaconv_dists[:num_pairs]
-                
-                # Check for NaN in AdaFace distances
-                if np.isnan(adaface_dists).any() or np.isinf(adaface_dists).any():
-                    print("WARNING: AdaFace distances contain NaN or Inf values. Replacing with zeros.")
-                    adaface_dists = np.nan_to_num(adaface_dists, nan=0.0, posinf=0.0, neginf=0.0)
-                
-                # Normalize distances to [0,1] range for fair comparison
-                adaface_range = np.max(adaface_dists) - np.min(adaface_dists)
-                if adaface_range > 1e-8:
-                    adaface_dists_norm = (adaface_dists - np.min(adaface_dists)) / adaface_range
-                else:
-                    print("WARNING: AdaFace distances have very small range. Using zeros.")
-                    adaface_dists_norm = np.zeros_like(adaface_dists)
-                
-                qaconv_range = np.max(qaconv_positive_dists) - np.min(qaconv_positive_dists)
-                if qaconv_range > 1e-8:
-                    qaconv_dists_norm = (qaconv_positive_dists - np.min(qaconv_positive_dists)) / qaconv_range
-                else:
-                    print("WARNING: QAConv distances have very small range. Using zeros.")
-                    qaconv_dists_norm = np.zeros_like(qaconv_positive_dists)
-                
-                # Adjust weights based on QAConv reliability
-                if direct_qaconv_acc < 0.5:
-                    print(f"WARNING: QAConv accuracy too low ({direct_qaconv_acc:.4f}). Using more weight on AdaFace for combined score.")
-                    adaface_weight = 0.8
-                    qaconv_weight = 0.2
-                else:
-                    # Use both with specified weights
-                    adaface_weight = self.adaface_eval_weight
-                    qaconv_weight = self.qaconv_eval_weight
-                
-                # Combine the normalized distances
-                combined_dists = adaface_weight * adaface_dists_norm + qaconv_weight * qaconv_dists_norm
-
-                # --- Debugging combined distances ---
-                print(f"DEBUG {dataname}: Normalized AdaFace distances stats - Min: {np.min(adaface_dists_norm):.6f}, Max: {np.max(adaface_dists_norm):.6f}, Mean: {np.mean(adaface_dists_norm):.6f}, Std: {np.std(adaface_dists_norm):.6f}")
-                print(f"DEBUG {dataname}: Normalized QAConv distances (positive pairs) stats - Min: {np.min(qaconv_dists_norm):.6f}, Max: {np.max(qaconv_dists_norm):.6f}, Mean: {np.mean(qaconv_dists_norm):.6f}, Std: {np.std(qaconv_dists_norm):.6f}")
-                print(f"DEBUG {dataname}: Combined distances stats - Min: {np.min(combined_dists):.6f}, Max: {np.max(combined_dists):.6f}, Mean: {np.mean(combined_dists):.6f}, Std: {np.std(combined_dists):.6f}")
-                print(f"DEBUG {dataname}: Number of unique combined distance values: {len(np.unique(combined_dists))}")
-                # --- End Debugging ---
-
-                # Calculate direct accuracy for combined scores
-                # Split distances into positive and negative pairs
-                pos_dists = combined_dists[issame]
-                neg_dists = combined_dists[~issame]
-                
-                # Calculate direct accuracy by comparing each sample to the average of the other class
-                direct_correct = 0
-                for i in range(len(pos_dists)):
-                    if pos_dists[i] < np.mean(neg_dists):
-                        direct_correct += 1
-                for i in range(len(neg_dists)):
-                    if neg_dists[i] > np.mean(pos_dists):
-                        direct_correct += 1
-                combined_acc = direct_correct / (len(pos_dists) + len(neg_dists))
-                
-                val_logs[f'{dataname}_combined_acc'] = combined_acc
-                print(f"{dataname} Combined accuracy: {combined_acc:.4f}")
-                
-            else:
-                print(f"Warning: {dataname} dataset has mismatched gallery/query sizes")
-                val_logs[f'{dataname}_qaconv_acc'] = 0.0
-                val_logs[f'{dataname}_combined_acc'] = 0.0
-            
+            print(f"{dataname} TransMatcher accuracy: {transmatcher_acc:.4f}")
+            print(f"{dataname} Combined accuracy: {combined_acc:.4f}")
             val_logs[f'{dataname}_num_val_samples'] = len(adaface_embeddings)
-
-        # average accuracies across datasets
-        val_logs['val_adaface_acc'] = np.mean([
-            val_logs[f'{dataname}_adaface_acc'] for dataname in dataname_to_idx.keys() 
-            if f'{dataname}_adaface_acc' in val_logs
-        ])
-        
-        # Average QAConv direct accuracies
-        qaconv_accs = []
-        for dataname in dataname_to_idx.keys():
-            if f'{dataname}_qaconv_acc' in val_logs:
-                qaconv_accs.append(val_logs[f'{dataname}_qaconv_acc'])
-        
-        val_logs['val_qaconv_acc'] = np.mean(qaconv_accs) if qaconv_accs else 0.0
-        
-        # Average combined accuracies
-        combined_accs = []
-        for dataname in dataname_to_idx.keys():
-            if f'{dataname}_combined_acc' in val_logs:
-                combined_accs.append(val_logs[f'{dataname}_combined_acc'])
-        
+            
+        # Mean accuracy across datasets
+        val_logs['val_adaface_acc'] = np.mean(adaface_accs) if adaface_accs else 0.0
+        val_logs['val_transmatcher_acc'] = np.mean(transmatcher_accs) if transmatcher_accs else 0.0
         val_logs['val_combined_acc'] = np.mean(combined_accs) if combined_accs else 0.0
-        
-        # Add val_acc for ModelCheckpoint to monitor (use the combined accuracy)
         val_logs['val_acc'] = val_logs['val_combined_acc']
-        
         val_logs['epoch'] = self.current_epoch
-
-        # Log validation metrics to wandb
+        
+        # Log to wandb
         wandb.log({
             'val_adaface_acc': val_logs.get('val_adaface_acc', 0.0),
-            'val_qaconv_acc': val_logs.get('val_qaconv_acc', 0.0),
+            'val_transmatcher_acc': val_logs.get('val_transmatcher_acc', 0.0),
             'val_combined_acc': val_logs.get('val_combined_acc', 0.0),
             'epoch': self.current_epoch,
         })
-
+        
         for k, v in val_logs.items():
             self.log(name=k, value=v)
-
         return None
 
     def test_step(self, batch, batch_idx):
         return self.validation_step(batch, batch_idx)
 
     def test_epoch_end(self, outputs):
-        all_adaface_tensor, all_norm_tensor, all_qaconv_tensor, all_target_tensor, all_dataname_tensor = self.gather_outputs(outputs)
-
+        # Same as validation_epoch_end, but for test set
+        all_adaface_tensor, all_norm_tensor, all_transmatcher_tensor, all_target_tensor, all_dataname_tensor = self.gather_outputs(outputs)
         dataname_to_idx = {"agedb_30": 0, "cfp_fp": 1, "lfw": 2, "cplfw": 3, "calfw": 4}
         idx_to_dataname = {val: key for key, val in dataname_to_idx.items()}
         test_logs = {}
-        
-        # Weight parameter for combining adaface and qaconv scores
-        adaface_weight = self.adaface_eval_weight  # Use class parameter instead of hardcoded value
-        qaconv_weight = self.qaconv_eval_weight    # Use class parameter instead of hardcoded value
-        
+        adaface_accs = []
+        transmatcher_accs = []
+        combined_accs = []
         for dataname_idx in all_dataname_tensor.unique():
             dataname = idx_to_dataname[dataname_idx.item()]
-            
-            # get data for this dataset
             mask = all_dataname_tensor == dataname_idx
             adaface_embeddings = all_adaface_tensor[mask].cpu().numpy()
-            qaconv_features = all_qaconv_tensor[mask]
+            transmatcher_features = all_transmatcher_tensor[mask]
             labels = all_target_tensor[mask].cpu().numpy()
             issame = labels[0::2]  # Original issame labels for the pairs
-            
             print(f"\nProcessing {dataname} with {len(adaface_embeddings)} samples")
+            # --- AdaFace Similarity Matrix ---
+            adaface_emb = torch.tensor(adaface_embeddings)
+            adaface_emb = torch.nn.functional.normalize(adaface_emb, p=2, dim=1)
+            adaface_sim = torch.matmul(adaface_emb, adaface_emb.t()).cpu().numpy()
+            # --- TransMatcher Similarity Matrix ---
+            N = transmatcher_features.shape[0]
+            # Initialize on device to avoid costly CPU-GPU transfers in loop
+            transmatcher_sim_tensor = torch.zeros((N, N), dtype=transmatcher_features.dtype, device=transmatcher_features.device)
+            batch_size = 256 # Increased batch size for faster computation
+            with torch.no_grad():
+                for i in range(0, N, batch_size):
+                    end_i = min(i + batch_size, N)
+                    query_batch = transmatcher_features[i:end_i]
+                    for j in range(0, N, batch_size):
+                        end_j = min(j + batch_size, N)
+                        gallery_batch = transmatcher_features[j:end_j]
+                        scores = self.model.transmatcher(query_batch, gallery_batch)
+                        transmatcher_sim_tensor[i:end_i, j:end_j] = scores
+            # Convert to numpy only once after all computations are done on device
+            transmatcher_sim = transmatcher_sim_tensor.cpu().numpy()
             
-            # evaluate adaface embeddings
-            tpr, fpr, accuracy, best_thresholds = evaluate_utils.evaluate(adaface_embeddings, issame, nrof_folds=10)
-            adaface_acc = accuracy.mean()
+            # --- Normalize both similarity matrices to [0, 1] ---
+            adaface_sim_norm = (adaface_sim - adaface_sim.min()) / (adaface_sim.max() - adaface_sim.min() + 1e-8)
+            transmatcher_sim_norm = (transmatcher_sim - transmatcher_sim.min()) / (transmatcher_sim.max() - transmatcher_sim.min() + 1e-8)
+            # --- Combined Similarity Matrix ---
+            combined_sim = self.adaface_loss_weight * adaface_sim_norm + self.transmatcher_loss_weight * transmatcher_sim_norm
+            # --- Compute accuracy for each method ---
+            n = len(labels)
+            pids = labels
+            label_matrix = pids[:, None] == pids[None, :]
+            indices = np.triu_indices(n, k=1)
+            issame_pairs = label_matrix[indices]
+            # AdaFace accuracy
+            adaface_scores = adaface_sim[indices]
+            # Calculate accuracy for genuine and impostor pairs separately
+            adaface_acc_genuine = np.mean(adaface_scores[issame_pairs] > adaface_scores[~issame_pairs].mean()) if issame_pairs.sum() > 0 else 0.0
+            adaface_acc_impostor = np.mean(adaface_scores[~issame_pairs] < adaface_scores[issame_pairs].mean()) if (~issame_pairs).sum() > 0 else 0.0
+            adaface_acc = (adaface_acc_genuine + adaface_acc_impostor) / 2.0
             test_logs[f'{dataname}_adaface_acc'] = adaface_acc
+            adaface_accs.append(adaface_acc)
+            # TransMatcher accuracy
+            transmatcher_scores = transmatcher_sim[indices]
+            # Calculate accuracy for genuine and impostor pairs separately
+            transmatcher_acc_genuine = np.mean(transmatcher_scores[issame_pairs] > transmatcher_scores[~issame_pairs].mean()) if issame_pairs.sum() > 0 else 0.0
+            transmatcher_acc_impostor = np.mean(transmatcher_scores[~issame_pairs] < transmatcher_scores[issame_pairs].mean()) if (~issame_pairs).sum() > 0 else 0.0
+            transmatcher_acc = (transmatcher_acc_genuine + transmatcher_acc_impostor) / 2.0
+            test_logs[f'{dataname}_transmatcher_acc'] = transmatcher_acc
+            transmatcher_accs.append(transmatcher_acc)
+            # Combined accuracy
+            combined_scores = combined_sim[indices]
+            # Calculate accuracy for genuine and impostor pairs separately
+            combined_acc_genuine = np.mean(combined_scores[issame_pairs] > combined_scores[~issame_pairs].mean()) if issame_pairs.sum() > 0 else 0.0
+            combined_acc_impostor = np.mean(combined_scores[~issame_pairs] < combined_scores[issame_pairs].mean()) if (~issame_pairs).sum() > 0 else 0.0
+            combined_acc = (combined_acc_genuine + combined_acc_impostor) / 2.0
+            test_logs[f'{dataname}_combined_acc'] = combined_acc
+            combined_accs.append(combined_acc)
             print(f"{dataname} AdaFace accuracy: {adaface_acc:.4f}")
-            
-            # Structure data for gallery-query pairs following the original repo approach
-            # Each consecutive pair of images forms a gallery-query pair
-            gallery_features = qaconv_features[0::2]  # Even indices (0, 2, 4...)
-            query_features = qaconv_features[1::2]    # Odd indices (1, 3, 5...)
-            
-            if len(gallery_features) == len(query_features) and len(gallery_features) > 0:
-                try:
-                    # Make sure QAConv is on the right device
-                    device = query_features.device
-                    if hasattr(self, 'qaconv'):
-                        self.qaconv = self.qaconv.to(device)
-                    
-                    num_pairs = len(gallery_features)
-                    print(f"Computing scores for {num_pairs} gallery-query pairs")
-                    
-                    # Verify inputs are properly normalized
-                    q_norms = torch.norm(query_features.view(query_features.size(0), -1), p=2, dim=1)
-                    g_norms = torch.norm(gallery_features.view(gallery_features.size(0), -1), p=2, dim=1)
-                    
-                    if (q_norms < 0.99).any() or (q_norms > 1.01).any():
-                        print(f"WARNING: Query features not properly normalized. Min: {q_norms.min().item():.4f}, Max: {q_norms.max().item():.4f}")
-                        query_features = F.normalize(query_features, p=2, dim=1)
-                    
-                    if (g_norms < 0.99).any() or (g_norms > 1.01).any():
-                        print(f"WARNING: Gallery features not properly normalized. Min: {g_norms.min().item():.4f}, Max: {g_norms.max().item():.4f}")
-                        gallery_features = F.normalize(gallery_features, p=2, dim=1)
-                    
-                    with torch.no_grad():
-                        # Compute scores for matching pairs (direct matches)
-                        positive_scores = self.qaconv.match_pairs(query_features, gallery_features)
-                    
-                        # Sample negative pairs (non-matching identities)
-                        # For efficiency, we'll sample a number of negative pairs equal to the positive pairs
-                        np.random.seed(42)  # For reproducibility
-                        
-                        # Initialize negative scores tensor
-                        negative_scores = torch.zeros(num_pairs, device=device)
-                        
-                        # Create a batch of random indices for non-matching pairs
-                        # Use a more structured approach - shift indices by half the dataset size
-                        # This ensures gallery-query pairs with definitely different identities
-                        half_size = num_pairs // 2
-                        
-                        for i in range(0, num_pairs, 32):  # Process in batches of 32 for efficiency
-                            end_idx = min(i + 32, num_pairs)
-                            batch_size = end_idx - i
-                            
-                            # For each gallery feature, pick a query feature from a different identity
-                            # by shifting the index by half the dataset size
-                            random_indices = np.zeros(batch_size, dtype=np.int64)
-                            
-                            for j in range(batch_size):
-                                # Shift by half the dataset to get truly different identity
-                                idx = (i + j + half_size) % num_pairs
-                                random_indices[j] = idx
-                            
-                            # Gather the random query features
-                            selected_queries = query_features[random_indices]
-                            batch_galleries = gallery_features[i:end_idx]
-                            
-                            # Compute scores for these negative pairs
-                            for j in range(batch_size):
-                                # Get scores for each gallery with its selected non-matching query
-                                score = self.qaconv(batch_galleries[j:j+1], selected_queries[j:j+1])
-                                negative_scores[i + j] = score.view(-1)[0]
-                    
-                        # Combine positive and negative scores and create labels
-                        all_scores = torch.cat([positive_scores, negative_scores])
-                        all_labels = torch.cat([
-                            torch.ones(num_pairs, device=device),   # Positive pairs are 1 (same identity)
-                            torch.zeros(num_pairs, device=device)   # Negative pairs are 0 (different identity)
-                        ])
-                        
-                        # Check for NaN values
-                        if torch.isnan(all_scores).any():
-                            print("WARNING: QAConv scores contain NaN values. Replacing with zeros.")
-                            all_scores = torch.nan_to_num(all_scores, nan=0.0)
-                    
-                    # Move to CPU for numpy conversion
-                    qaconv_scores = all_scores.cpu().numpy()
-                    pair_labels = all_labels.cpu().numpy().astype(bool)
-                    
-                    # Print score stats for debugging
-                    pos_scores = qaconv_scores[:num_pairs]
-                    neg_scores = qaconv_scores[num_pairs:]
-                    print(f"QAConv positive scores - min: {np.min(pos_scores):.4f}, max: {np.max(pos_scores):.4f}")
-                    print(f"QAConv negative scores - min: {np.min(neg_scores):.4f}, max: {np.max(neg_scores):.4f}")
-                    
-                    # Check if scores are inverted (negative pairs getting higher scores than positive pairs)
-                    pos_mean = np.mean(pos_scores)
-                    neg_mean = np.mean(neg_scores)
-                    print(f"QAConv score means - positive: {pos_mean:.4f}, negative: {neg_mean:.4f}")
-                    
-                    # If scores are inverted (negative pairs getting higher scores), flip the labels
-                    labels_flipped = False
-                    if neg_mean > pos_mean:
-                        print("WARNING: QAConv scores appear to be inverted (negative pairs have higher scores). Flipping labels.")
-                        # Invert the labels (0 becomes 1, 1 becomes 0)
-                        pair_labels = ~pair_labels
-                        labels_flipped = True
-                    
-                    # Check if scores are extremely large, which might cause numerical issues
-                    if pos_mean > 100 or neg_mean > 100:
-                        print(f"WARNING: QAConv scores are extremely large (pos_mean: {pos_mean:.4f}, neg_mean: {neg_mean:.4f}). Normalizing...")
-                        # Normalize scores to have mean of 0 and standard deviation of 1
-                        all_mean = np.mean(qaconv_scores)
-                        all_std = np.std(qaconv_scores)
-                    
-                        # Prevent division by zero
-                        if all_std < 1e-8:
-                            all_std = 1.0
-                            
-                        qaconv_scores = (qaconv_scores - all_mean) / all_std
-                        # Re-compute positive and negative scores after normalization
-                        pos_scores = qaconv_scores[:num_pairs]
-                        neg_scores = qaconv_scores[num_pairs:]
-                        print(f"After normalization - Positive: {np.mean(pos_scores):.4f}, Negative: {np.mean(neg_scores):.4f}")
-                    
-                    # For ROC calculation, we need distances (smaller = more similar)
-                    # For QAConv scores, higher = more similar, so negate them to get distances
-                    qaconv_dists = -qaconv_scores
-                    
-                    # For highly reliable classification, ensure pos and neg are well separated
-                    # Compute separation margin between positive and negative
-                    qaconv_pos_dists = qaconv_dists[:num_pairs]
-                    qaconv_neg_dists = qaconv_dists[num_pairs:]
-                    
-                    # Calculate direct accuracy by comparing each sample to the average of the other class
-                    direct_correct = 0
-                    for i in range(num_pairs):
-                        if qaconv_pos_dists[i] < np.mean(qaconv_neg_dists):
-                            direct_correct += 1
-                    for i in range(num_pairs):
-                        if qaconv_neg_dists[i] > np.mean(qaconv_pos_dists):
-                            direct_correct += 1
-                    direct_qaconv_acc = direct_correct / (2 * num_pairs)
-                    
-                    # Log the direct accuracy as the primary QAConv metric
-                    test_logs[f'{dataname}_qaconv_acc'] = direct_qaconv_acc
-                    print(f"{dataname} QAConv accuracy: {direct_qaconv_acc:.4f}")
-                    
-                except Exception as e:
-                    import traceback
-                    print(f"WARNING: Error during QAConv matching: {e}")
-                    print(traceback.format_exc())
-                    # Fallback: create dummy scores
-                    qaconv_scores = np.zeros(2 * len(gallery_features))
-                    direct_qaconv_acc = 0.0
-                    test_logs[f'{dataname}_qaconv_acc'] = direct_qaconv_acc
-                    continue
-                
-                # Calculate AdaFace distances for each pair
-                adaface_embeddings1 = adaface_embeddings[0::2]  # gallery
-                adaface_embeddings2 = adaface_embeddings[1::2]  # query
-                adaface_dists = np.zeros(len(adaface_embeddings1))
-                
-                for i in range(len(adaface_embeddings1)):
-                    diff = adaface_embeddings1[i] - adaface_embeddings2[i]
-                    adaface_dists[i] = np.sum(np.square(diff))
-                
-                # For combined evaluation, we need to select only the positive pair scores from QAConv
-                # since we don't have negative pair scores for AdaFace in the same format
-                qaconv_positive_dists = qaconv_dists[:num_pairs]
-                
-                # Check for NaN in AdaFace distances
-                if np.isnan(adaface_dists).any() or np.isinf(adaface_dists).any():
-                    print("WARNING: AdaFace distances contain NaN or Inf values. Replacing with zeros.")
-                    adaface_dists = np.nan_to_num(adaface_dists, nan=0.0, posinf=0.0, neginf=0.0)
-                
-                # Normalize distances to [0,1] range for fair comparison
-                adaface_range = np.max(adaface_dists) - np.min(adaface_dists)
-                if adaface_range > 1e-8:
-                    adaface_dists_norm = (adaface_dists - np.min(adaface_dists)) / adaface_range
-                else:
-                    print("WARNING: AdaFace distances have very small range. Using zeros.")
-                    adaface_dists_norm = np.zeros_like(adaface_dists)
-                
-                qaconv_range = np.max(qaconv_positive_dists) - np.min(qaconv_positive_dists)
-                if qaconv_range > 1e-8:
-                    qaconv_dists_norm = (qaconv_positive_dists - np.min(qaconv_positive_dists)) / qaconv_range
-                else:
-                    print("WARNING: QAConv distances have very small range. Using zeros.")
-                    qaconv_dists_norm = np.zeros_like(qaconv_positive_dists)
-                
-                # Adjust weights based on QAConv reliability
-                if direct_qaconv_acc < 0.5:
-                    print(f"WARNING: QAConv accuracy too low ({direct_qaconv_acc:.4f}). Using more weight on AdaFace for combined score.")
-                    adaface_weight = 0.8
-                    qaconv_weight = 0.2
-                else:
-                    # Use both with specified weights
-                    adaface_weight = self.adaface_eval_weight
-                    qaconv_weight = self.qaconv_eval_weight
-                
-                # Combine the normalized distances
-                combined_dists = adaface_weight * adaface_dists_norm + qaconv_weight * qaconv_dists_norm
-
-                # --- Debugging combined distances ---
-                print(f"DEBUG {dataname}: Normalized AdaFace distances stats - Min: {np.min(adaface_dists_norm):.6f}, Max: {np.max(adaface_dists_norm):.6f}, Mean: {np.mean(adaface_dists_norm):.6f}, Std: {np.std(adaface_dists_norm):.6f}")
-                print(f"DEBUG {dataname}: Normalized QAConv distances (positive pairs) stats - Min: {np.min(qaconv_dists_norm):.6f}, Max: {np.max(qaconv_dists_norm):.6f}, Mean: {np.mean(qaconv_dists_norm):.6f}, Std: {np.std(qaconv_dists_norm):.6f}")
-                print(f"DEBUG {dataname}: Combined distances stats - Min: {np.min(combined_dists):.6f}, Max: {np.max(combined_dists):.6f}, Mean: {np.mean(combined_dists):.6f}, Std: {np.std(combined_dists):.6f}")
-                print(f"DEBUG {dataname}: Number of unique combined distance values: {len(np.unique(combined_dists))}")
-                # --- End Debugging ---
-
-                # Calculate direct accuracy for combined scores
-                # Split distances into positive and negative pairs
-                pos_dists = combined_dists[issame]
-                neg_dists = combined_dists[~issame]
-                
-                # Calculate direct accuracy by comparing each sample to the average of the other class
-                direct_correct = 0
-                for i in range(len(pos_dists)):
-                    if pos_dists[i] < np.mean(neg_dists):
-                        direct_correct += 1
-                for i in range(len(neg_dists)):
-                    if neg_dists[i] > np.mean(pos_dists):
-                        direct_correct += 1
-                combined_acc = direct_correct / (len(pos_dists) + len(neg_dists))
-                
-                test_logs[f'{dataname}_combined_acc'] = combined_acc
-                print(f"{dataname} Combined accuracy: {combined_acc:.4f}")
-                
-            else:
-                print(f"Warning: {dataname} dataset has mismatched gallery/query sizes")
-                test_logs[f'{dataname}_qaconv_acc'] = 0.0
-                test_logs[f'{dataname}_combined_acc'] = 0.0
-            
+            print(f"{dataname} TransMatcher accuracy: {transmatcher_acc:.4f}")
+            print(f"{dataname} Combined accuracy: {combined_acc:.4f}")
             test_logs[f'{dataname}_num_test_samples'] = len(adaface_embeddings)
-
-        # average accuracies across datasets
-        test_logs['test_adaface_acc'] = np.mean([
-            test_logs[f'{dataname}_adaface_acc'] for dataname in dataname_to_idx.keys() 
-            if f'{dataname}_adaface_acc' in test_logs
-        ])
-        
-        # Average QAConv direct accuracies
-        qaconv_accs = []
-        for dataname in dataname_to_idx.keys():
-            if f'{dataname}_qaconv_acc' in test_logs:
-                qaconv_accs.append(test_logs[f'{dataname}_qaconv_acc'])
-        
-        test_logs['test_qaconv_acc'] = np.mean(qaconv_accs) if qaconv_accs else 0.0
-        
-        # Average combined accuracies
-        combined_accs = []
-        for dataname in dataname_to_idx.keys():
-            if f'{dataname}_combined_acc' in test_logs:
-                combined_accs.append(test_logs[f'{dataname}_combined_acc'])
-        
+        test_logs['test_adaface_acc'] = np.mean(adaface_accs) if adaface_accs else 0.0
+        test_logs['test_transmatcher_acc'] = np.mean(transmatcher_accs) if transmatcher_accs else 0.0
         test_logs['test_combined_acc'] = np.mean(combined_accs) if combined_accs else 0.0
-        
-        # Add test_acc for consistency
         test_logs['test_acc'] = test_logs['test_combined_acc']
-        
         test_logs['epoch'] = self.current_epoch
-
+        # Log to wandb after each test epoch
+        wandb.log({
+            'test_adaface_acc': test_logs.get('test_adaface_acc', 0.0),
+            'test_transmatcher_acc': test_logs.get('test_transmatcher_acc', 0.0),
+            'test_combined_acc': test_logs.get('test_combined_acc', 0.0),
+            'epoch': self.current_epoch,
+        })
         for k, v in test_logs.items():
             self.log(name=k, value=v)
-
         return None
 
     def gather_outputs(self, outputs):
         if self.hparams.distributed_backend == 'ddp':
-            # gather outputs across gpu
             outputs_list = []
             _outputs_list = utils.all_gather(outputs)
             for _outputs in _outputs_list:
                 outputs_list.extend(_outputs)
         else:
             outputs_list = outputs
-
         all_adaface_tensor = torch.cat([out['adaface_output'] for out in outputs_list], axis=0).to('cpu')
         all_norm_tensor = torch.cat([out['norm'] for out in outputs_list], axis=0).to('cpu')
-        all_qaconv_tensor = torch.cat([out['qaconv_output'] for out in outputs_list], axis=0).to('cpu')
+        all_transmatcher_tensor = torch.cat([out['transmatcher_output'] for out in outputs_list], axis=0).to('cpu')
         all_target_tensor = torch.cat([out['target'] for out in outputs_list], axis=0).to('cpu')
         all_dataname_tensor = torch.cat([out['dataname'] for out in outputs_list], axis=0).to('cpu')
         all_image_index = torch.cat([out['image_index'] for out in outputs_list], axis=0).to('cpu')
-
-        # get rid of duplicate index outputs
         unique_dict = {}
-        for _ada, _nor, _qa, _tar, _dat, _idx in zip(all_adaface_tensor, all_norm_tensor, all_qaconv_tensor,
+        for _ada, _nor, _tm, _tar, _dat, _idx in zip(all_adaface_tensor, all_norm_tensor, all_transmatcher_tensor,
                                                    all_target_tensor, all_dataname_tensor, all_image_index):
             unique_dict[_idx.item()] = {
                 'adaface_output': _ada, 
                 'norm': _nor,
-                'qaconv_output': _qa, 
+                'transmatcher_output': _tm, 
                 'target': _tar,
                 'dataname': _dat
             }
         unique_keys = sorted(unique_dict.keys())
         all_adaface_tensor = torch.stack([unique_dict[key]['adaface_output'] for key in unique_keys], axis=0)
         all_norm_tensor = torch.stack([unique_dict[key]['norm'] for key in unique_keys], axis=0)
-        all_qaconv_tensor = torch.stack([unique_dict[key]['qaconv_output'] for key in unique_keys], axis=0)
+        all_transmatcher_tensor = torch.stack([unique_dict[key]['transmatcher_output'] for key in unique_keys], axis=0)
         all_target_tensor = torch.stack([unique_dict[key]['target'] for key in unique_keys], axis=0)
         all_dataname_tensor = torch.stack([unique_dict[key]['dataname'] for key in unique_keys], axis=0)
-
-        return all_adaface_tensor, all_norm_tensor, all_qaconv_tensor, all_target_tensor, all_dataname_tensor
+        return all_adaface_tensor, all_norm_tensor, all_transmatcher_tensor, all_target_tensor, all_dataname_tensor
 
     def split_parameters(self, module):
         """ Split parameters into with and without weight decay.
-        Special handling for QAConv parameters to ensure proper optimization.
+        Handles AdaFace backbone, head, and TransMatcher parameters only.
         """
         params_decay = []
         params_no_decay = []
-        
         for m in module.modules():
             if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
                 params_no_decay.extend([*m.parameters()])
-            elif isinstance(m, type(self.qaconv)) if hasattr(self, 'qaconv') else False:
-                # Handle QAConv parameters - class embeddings should use weight decay
-                if hasattr(m, 'class_embed') and m.class_embed is not None:
-                    params_decay.append(m.class_embed)
-                # Other QAConv parameters (bn, fc) follow normal rules
-                if hasattr(m, 'bn'):
-                    params_no_decay.extend([*m.bn.parameters()])
-                if hasattr(m, 'logit_bn'):
-                    params_no_decay.extend([*m.logit_bn.parameters()])
-                if hasattr(m, 'fc'):
-                    params_decay.extend([*m.fc.parameters()])
             elif len(list(m.children())) == 0:
                 params_decay.extend([*m.parameters()])
-        
-        # Verify all parameters are accounted for
-        all_params = set(module.parameters())
-        decay_params = set(params_decay)
-        no_decay_params = set(params_no_decay)
-        
-        # Check for missing or duplicate parameters
-        missing_params = all_params - (decay_params | no_decay_params)
-        duplicate_params = decay_params & no_decay_params
-        
-        if missing_params:
-            print("WARNING: Some parameters were not assigned to decay/no-decay groups:")
-            for p in missing_params:
-                params_decay.append(p)
-                print(f"- Adding parameter of shape {p.shape} to decay group")
-        
-        if duplicate_params:
-            print("WARNING: Some parameters were assigned to both decay and no-decay groups:")
-            for p in duplicate_params:
-                params_no_decay.remove(p)
-                print(f"- Removing duplicate parameter of shape {p.shape} from no-decay group")
-        
+        # Add head kernel (for AdaFace head)
+        if hasattr(self, 'head') and hasattr(self.head, 'kernel'):
+            params_decay.append(self.head.kernel)
         return params_decay, params_no_decay
 
     def configure_optimizers(self):
+        # Only AdaFace backbone, head, and TransMatcher parameters are handled
         paras_wo_bn, paras_only_bn = self.split_parameters(self.model)
-        
-        # Add QAConv parameters if available
-        if hasattr(self, 'qaconv') and self.qaconv is not None:
-            qaconv_paras_wo_bn, qaconv_paras_only_bn = self.split_parameters(self.qaconv)
-            paras_wo_bn.extend(qaconv_paras_wo_bn)
-            paras_only_bn.extend(qaconv_paras_only_bn)
-
+        # Add TransMatcher parameters (if not already included)
+        if hasattr(self.model, 'transmatcher'):
+            tm_decay, tm_no_decay = self.split_parameters(self.model.transmatcher)
+            paras_wo_bn.extend(tm_decay)
+            paras_only_bn.extend(tm_no_decay)
         optimizer = optim.SGD([{
-            'params': paras_wo_bn + [self.head.kernel],
+            'params': paras_wo_bn,
             'weight_decay': 5e-4
         }, {
             'params': paras_only_bn
         }],
                                 lr=self.hparams.lr,
                                 momentum=self.hparams.momentum)
-
         scheduler = lr_scheduler.MultiStepLR(optimizer,
                                              milestones=self.hparams.lr_milestones,
                                              gamma=self.hparams.lr_gamma)
-
         return [optimizer], [scheduler]
 
     def evaluate_with_distances(self, distances, issame, nrof_folds=10):

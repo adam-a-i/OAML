@@ -9,7 +9,16 @@ from pytorch_lightning import seed_everything
 import config
 import os
 from utils import dotdict
+import importlib
+import sys
+
+# Force reload train_val module
+if 'train_val' in sys.modules:
+    del sys.modules['train_val']
 import train_val
+print("train_val module path:", train_val.__file__)
+print("train_val module contents:", dir(train_val))
+
 import data
 import inspect
 

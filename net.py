@@ -9,9 +9,9 @@ from torch.nn import BatchNorm1d, BatchNorm2d
 from torch.nn import ReLU, Sigmoid
 from torch.nn import Module
 from torch.nn import PReLU
-from qaconv import QAConv
 import os
 import torch.nn.functional as F
+from transmatcher import TransMatcher
 
 def build_model(model_name='ir_50'):
     if model_name == 'ir_101':
@@ -52,7 +52,7 @@ class Flatten(Module):
     """ Flat tensor
     """
     def forward(self, input):
-        return input.view(input.size(0), -1)
+        return input.reshape(input.size(0), -1)
 
 
 class LinearBlock(Module):
@@ -305,17 +305,23 @@ class Backbone(Module):
         self.body = Sequential(*modules)
 
         if input_size[0] == 112:
-            self.output_layer = Sequential(BatchNorm2d(output_channel),
-                                        Dropout(0.4), Flatten(),
-                                        Linear(output_channel * 7 * 7, 512),
-                                        BatchNorm1d(512, affine=False))
-            self.qaconv = QAConv(num_features=output_channel, height=7, width=7)
+            self.output_layer = Sequential(
+                BatchNorm2d(output_channel),
+                Dropout(0.4),
+                Flatten(),
+                Linear(output_channel * 7 * 7, 512),
+                BatchNorm1d(512, affine=False)
+            )
+            self.transmatcher = TransMatcher(seq_len=7*7, d_model=output_channel, num_decoder_layers=3)
         else:
             self.output_layer = Sequential(
-                BatchNorm2d(output_channel), Dropout(0.4), Flatten(),
+                BatchNorm2d(output_channel),
+                Dropout(0.4),
+                Flatten(),
                 Linear(output_channel * 14 * 14, 512),
-                BatchNorm1d(512, affine=False))
-            self.qaconv = QAConv(num_features=output_channel, height=14, width=14)
+                BatchNorm1d(512, affine=False)
+            )
+            self.transmatcher = TransMatcher(seq_len=14*14, d_model=output_channel, num_decoder_layers=3)
 
         initialize_weights(self.modules())
         
@@ -333,71 +339,82 @@ class Backbone(Module):
             module.register_forward_hook(lambda mod, inp, out, idx=i: hook_fn(mod, inp, out, idx))
 
     def forward(self, x):
-        # Process through input layer
+        # Process through input layer with gradient clipping
         x = self.input_layer(x)
+        print(f"DEBUG: After input_layer - shape: {x.shape}")
+        if x.requires_grad:
+            x.register_hook(lambda grad: torch.nn.utils.clip_grad_norm_(grad, max_norm=1.0))
         
-        # Process through body with layer-by-layer NaN checks
-        # Specifically fix problematic layers 22 and 23
+        # Process through body with layer-by-layer NaN checks and stabilization
         for idx, module in enumerate(self.body):
             x = module(x)
+            print(f"DEBUG: After body layer {idx} - shape: {x.shape}")
+            
+            # Apply special handling for layers 22-23 that are causing issues
+            if idx in [21, 22, 23]:
+                # 1. Clip extreme values
+                x = torch.clamp(x, min=-10.0, max=10.0)
+                
+                # 2. Apply layer normalization for stability
+                x = F.layer_norm(x.permute(0, 2, 3, 1), [x.size(1)]).permute(0, 3, 1, 2)
+                print(f"DEBUG: After layer norm in layer {idx} - shape: {x.shape}")
+                
+                # 3. Add small epsilon to prevent zeros
+                x = x + 1e-6
+                
+                # 4. Normalize feature maps
+                x = F.normalize(x.reshape(x.size(0), x.size(1), -1), p=2, dim=2).reshape_as(x)
+                print(f"DEBUG: After feature normalization in layer {idx} - shape: {x.shape}")
+                
+                # 5. Gradient clipping for these specific layers
+                if x.requires_grad:
+                    x.register_hook(lambda grad: torch.nn.utils.clip_grad_norm_(grad, max_norm=1.0))
             
             # Check for NaNs after each body layer
             if torch.isnan(x).any():
                 print(f"WARNING: Values after body layer {idx} contain NaNs. Replacing with zeros.")
                 x = torch.nan_to_num(x, nan=0.0)
-                
-            # Apply special handling for layers 22-23 that are causing issues
-            if idx in [21, 22, 23]:
-                # Special stabilization for troublesome layers
-                # 1. Check for extremely small values that might cause instability in future layers
-                small_values_mask = (x.abs() < 1e-6) & (x != 0)
-                if small_values_mask.any():
-                    # Set very small non-zero values to a safe minimum to prevent potential division issues
-                    x = torch.where(small_values_mask, torch.sign(x) * 1e-6, x)
-                    
-                # 2. Check feature norm stability
-                norms = torch.norm(x.view(x.size(0), x.size(1), -1), dim=2)
-                if (norms < 1e-7).any():
-                    # Apply channel-wise normalization to prevent collapse
-                    x = F.layer_norm(x, [x.size(2), x.size(3)])
+                # Add small epsilon to prevent all zeros
+                x = x + 1e-6
         
-        # Check for NaNs or zeros in feature maps
-        if torch.isnan(x).any() or (torch.sum(x.abs()) < 1e-4):
-            print("WARNING: Feature maps contain NaNs or zeros before normalization. Fixing.")
-            x = torch.nan_to_num(x, nan=0.0)
-            # Apply stable normalization if needed
-            if torch.sum(x.abs()) < 1e-4:
-                x = x + 1e-6  # Add small constant to prevent all zeros
-                
-        feature_maps = x  # Store feature maps for QAConv
+        # Final feature map stabilization
+        feature_maps = x
+        print(f"DEBUG: Final feature maps before normalization - shape: {feature_maps.shape}")
         
-        # Check norms of feature maps to ensure they're reasonable
-        norms = torch.norm(feature_maps.view(feature_maps.size(0), -1), p=2, dim=1)
-        print(f"Feature map norms - min: {norms.min().item():.6f}, max: {norms.max().item():.6f}")
+        # Ensure feature maps are properly normalized
+        feature_maps = F.normalize(feature_maps.reshape(feature_maps.size(0), feature_maps.size(1), -1), p=2, dim=2).reshape_as(feature_maps)
+        print(f"DEBUG: Feature maps after normalization - shape: {feature_maps.shape}")
         
-        # Get the output embedding
+        # Store feature maps for TransMatcher in [B, H, W, C] format
+        feature_maps_tm = feature_maps.permute(0, 2, 3, 1).contiguous()
+        print(f"DEBUG: Feature maps for TransMatcher - shape: {feature_maps_tm.shape}")
+        print(f"DEBUG: Expected seq_len: {self.transmatcher.seq_len}, actual: {feature_maps_tm.size(1) * feature_maps_tm.size(2)}")
+        print(f"DEBUG: Expected d_model: {self.transmatcher.d_model}, actual: {feature_maps_tm.size(3)}")
+        
+        # Get the output embedding with gradient clipping
         embedding = self.output_layer(feature_maps)
+        print(f"DEBUG: Output embedding - shape: {embedding.shape}")
+        if embedding.requires_grad:
+            embedding.register_hook(lambda grad: torch.nn.utils.clip_grad_norm_(grad, max_norm=1.0))
         
-        # Check for NaNs in embeddings
-        if torch.isnan(embedding).any():
-            print("WARNING: AdaFace embeddings contain NaNs. Replacing with zeros.")
-            embedding = torch.nan_to_num(embedding, nan=0.0)
-            
-        # Safely normalize the final output
-        norm = torch.norm(embedding, 2, 1, True).clamp(min=1e-6)  # Clamp to avoid division by zero
+        # Final normalization with epsilon to prevent division by zero
+        norm = torch.norm(embedding, 2, 1, True).clamp(min=1e-6)
         output = torch.div(embedding, norm)
+        print(f"DEBUG: Final output - shape: {output.shape}")
 
-        # QAConv matching score - only return during inference when gallery features are set
+        # TransMatcher matching score - only return during inference when gallery features are set
         if self.training == False and hasattr(self, '_gallery_features'):
-            # Use feature maps directly without normalization to avoid introducing NaNs
-            qaconv_score = self.qaconv(feature_maps, self._gallery_features)
-            return output, norm, qaconv_score
+            print(f"DEBUG: Gallery features shape: {self._gallery_features.shape}")
+            score = self.transmatcher(self._gallery_features, feature_maps_tm)
+            print(f"DEBUG: TransMatcher score shape: {score.shape}")
+            return output, norm, score
         
         return output, norm
 
     def set_gallery_features(self, gallery_features):
-        """Store gallery features for QAConv matching"""
-        self._gallery_features = gallery_features
+        """Store gallery features for TransMatcher matching"""
+        # Ensure gallery_features are in [B, H, W, C] format
+        self._gallery_features = gallery_features.permute(0, 2, 3, 1).contiguous()
 
 
 def IR_18(input_size):
