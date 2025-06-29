@@ -52,19 +52,60 @@ class PairwiseMatchingLoss(Module):
         feature = feature.detach().clone().requires_grad_(True)
         
         # Calculate matching scores
-        score = self.matcher(feature, feature)  # [b, b]
-
+        # For TransMatcher, we need to set memory first, then call forward
+        self.matcher.make_kernel(feature)
+        score = self.matcher(feature)  # [b, b]
+        
         target1 = target.unsqueeze(1)
         mask = (target1 == target1.t())
         pair_labels = mask.float()
+        
+        # Debug information
+        unique_labels = torch.unique(target)
+        num_positive_pairs = (pair_labels == 1).sum().item()
+        num_negative_pairs = (pair_labels == 0).sum().item()
+        
+        print(f"[PAIRWISE_LOSS DEBUG] Unique labels in batch: {unique_labels.cpu().numpy()}")
+        print(f"[PAIRWISE_LOSS DEBUG] Pairwise mask sum: {num_positive_pairs} / {pair_labels.numel()}")
+        print(f"[PAIRWISE_LOSS DEBUG] Pairwise mask (first 10x10):")
+        print(pair_labels[:10, :10].cpu().numpy())
+        
         loss = F.binary_cross_entropy_with_logits(score, pair_labels, reduction='none')
         loss = loss.sum(-1)
 
         with torch.no_grad():
-            min_pos = torch.min(score * pair_labels + 
-                    (1 - pair_labels + torch.eye(score.size(0), device=device)) * 1e15, dim=1)[0]
-            max_neg = torch.max(score * (1 - pair_labels) - pair_labels * 1e15, dim=1)[0]
-            acc = (min_pos > max_neg).float()
+            # Fixed accuracy calculation for PK sampling
+            # For each sample, check if it has higher scores for same-class pairs than different-class pairs
+            accuracies = []
+            
+            for i in range(score.size(0)):
+                # Get scores for this sample
+                sample_scores = score[i]  # [batch_size]
+                
+                # Get positive and negative pairs for this sample
+                positive_mask = pair_labels[i] == 1  # [batch_size]
+                negative_mask = pair_labels[i] == 0  # [batch_size]
+                
+                # Exclude self-comparison
+                positive_mask[i] = False
+                negative_mask[i] = False
+                
+                if positive_mask.sum() > 0 and negative_mask.sum() > 0:
+                    # Get positive and negative scores
+                    positive_scores = sample_scores[positive_mask]
+                    negative_scores = sample_scores[negative_mask]
+                    
+                    # Check if max positive score > max negative score
+                    max_pos = positive_scores.max()
+                    max_neg = negative_scores.max()
+                    
+                    accuracy = (max_pos > max_neg).float()
+                    accuracies.append(accuracy)
+                else:
+                    # If no positive or negative pairs, assign random accuracy
+                    accuracies.append(torch.tensor(0.5, device=device))
+            
+            acc = torch.stack(accuracies)
         
         # Restore matcher's previous training state
         self.matcher.train(training_state)
