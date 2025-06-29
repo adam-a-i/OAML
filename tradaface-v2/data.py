@@ -9,6 +9,7 @@ from dataset.image_folder_dataset import CustomImageFolderDataset
 from dataset.five_validation_dataset import FiveValidationDataset
 from dataset.record_dataset import AugmentRecordDataset
 from transforms import MedicalMaskOcclusion
+from sampler import RandomIdentitySampler
 
 
 class DataModule(pl.LightningDataModule):
@@ -28,6 +29,10 @@ class DataModule(pl.LightningDataModule):
         self.photometric_augmentation_prob = kwargs['photometric_augmentation_prob']
         self.swap_color_channel = kwargs['swap_color_channel']
         self.use_mxrecord = kwargs['use_mxrecord']
+
+        # PK sampler config
+        self.pk_sampler = kwargs.get('pk_sampler', True)
+        self.num_instances = kwargs.get('num_instances', 2)  # Reduced from 4 to 2 for better PK sampling
 
         concat_mem_file_name = os.path.join(self.data_root, self.val_data_path, 'concat_validation_memfile')
         self.concat_mem_file_name = concat_mem_file_name
@@ -79,7 +84,16 @@ class DataModule(pl.LightningDataModule):
             self.test_dataset = test_dataset(self.data_root, self.val_data_path, self.concat_mem_file_name)
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True)
+        if self.pk_sampler:
+            # Calculate N = batch_size // num_instances
+            # Increase N to get more identities per batch for better PK sampling
+            n_identities = max(16, self.batch_size // self.num_instances)  # At least 16 identities
+            actual_batch_size = n_identities * self.num_instances
+            print(f"[DataModule] Using PK sampler: N={n_identities}, K={self.num_instances}, batch_size={actual_batch_size}")
+            sampler = RandomIdentitySampler(self.train_dataset, num_instances=self.num_instances)
+            return DataLoader(self.train_dataset, batch_size=actual_batch_size, sampler=sampler, num_workers=self.num_workers, drop_last=True)
+        else:
+            return DataLoader(self.train_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True)
 
     def val_dataloader(self):
         return DataLoader(self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False)

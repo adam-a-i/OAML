@@ -216,10 +216,6 @@ class TransMatcher(nn.Module):
             if features.dim() == 4:
                 features = features.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
         
-        print(f"DEBUG: features shape after permutation: {features.shape}")
-        print(f"DEBUG: memory shape: {self.memory.shape}")
-        print(f"DEBUG: seq_len={self.seq_len}, d_model={self.d_model}")
-        
         # FIXED: Use original argument order - memory first, features second
         score = self.decoder(self.memory, features)
         return score

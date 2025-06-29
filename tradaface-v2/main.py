@@ -186,13 +186,13 @@ if __name__ == '__main__':
         torch.set_num_threads(1)
         args.total_batch_size = args.batch_size
         args.batch_size = int(args.batch_size / max(1, args.gpus))
-        args.num_workers = min(args.num_workers, 2)  # Further reduced max workers
+        args.num_workers = min(args.num_workers, 16)  # Allow up to 8 workers as specified
         print(f"[MAIN] Adjusted batch size: {args.total_batch_size} -> {args.batch_size}")
         
-        # Force smaller batch size for memory constraints
-        if args.batch_size > 4:
-            args.batch_size = 4
-            print(f"[MAIN] Further reduced batch size to {args.batch_size} for memory constraints")
+        # Remove the hardcoded batch size limitation - let user's batch size be used
+        # Only warn if batch size is very large
+        if args.batch_size > 128:
+            print(f"[MAIN] WARNING: Large batch size ({args.batch_size}) may cause memory issues")
 
     if args.resume_from_checkpoint:
         assert args.resume_from_checkpoint.endswith('.ckpt')

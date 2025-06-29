@@ -61,16 +61,6 @@ class PairwiseMatchingLoss(Module):
             mask = (target1 == target1.t())
             pair_labels = mask.float()
             
-            # Debug information
-            unique_labels = torch.unique(target)
-            num_positive_pairs = (pair_labels == 1).sum().item()
-            num_negative_pairs = (pair_labels == 0).sum().item()
-            
-            print(f"[PAIRWISE_LOSS DEBUG] Unique labels in batch: {unique_labels.cpu().numpy()}")
-            print(f"[PAIRWISE_LOSS DEBUG] Pairwise mask sum: {num_positive_pairs} / {pair_labels.numel()}")
-            print(f"[PAIRWISE_LOSS DEBUG] Pairwise mask (first 10x10):")
-            print(pair_labels[:10, :10].cpu().numpy())
-            
             loss = F.binary_cross_entropy_with_logits(score, pair_labels, reduction='none')
             loss = loss.sum(-1)
 
