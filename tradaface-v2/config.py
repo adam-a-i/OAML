@@ -23,7 +23,13 @@ def get_args():
                                     'batch size of all GPUs on the current node when '
                                     'using Data Parallel or Distributed Data Parallel')
 
-    parent_parser.add_argument('--lr',help='learning rate',default=1e-4, type=float)
+    # PK Sampler parameters
+    parent_parser.add_argument('--pk_sampler', action='store_true', default=True, 
+                               help='use PK sampler for metric learning')
+    parent_parser.add_argument('--num_instances', default=4, type=int,
+                               help='number of instances per identity for PK sampling (K)')
+
+    parent_parser.add_argument('--lr',help='learning rate',default=1e-5, type=float)
     parent_parser.add_argument('--lr_milestones', default='8,12,14', type=str, help='epochs for reducing LR')
     parent_parser.add_argument('--lr_gamma', default=0.1, type=float, help='multiply when reducing LR')
 

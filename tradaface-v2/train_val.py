@@ -21,8 +21,7 @@ class Trainer(pl.LightningModule):
     def __init__(self, **kwargs):
         super(Trainer, self).__init__()
         self.save_hyperparameters()  # sets self.hparams
-        # Use automatic optimization for better performance
-        self.automatic_optimization = True
+        self.automatic_optimization = False
 
         # --- LOSS WEIGHTS ---
         # Set these values to control the loss contribution
@@ -41,6 +40,8 @@ class Trainer(pl.LightningModule):
         # The TransMatcher is now integrated into the backbone
         # We can access it directly from the backbone
         self.model = backbone
+        
+        # Use the original pairwise loss that worked with QAConv
         self.pairwise_matching_loss = pairwise_matching_loss.PairwiseMatchingLoss(self.model.transmatcher)
 
         self.head = head.build_head(head_type=self.hparams.head,
@@ -204,31 +205,17 @@ class Trainer(pl.LightningModule):
             print(f"  - Labels has NaN: {torch.isnan(label.float()).any()}")
             adaface_loss = torch.tensor(0.0, device=device)
         
-        # TransMatcher loss - compute less frequently to speed up training
+        # TransMatcher loss
         transmatcher_loss = torch.tensor(0.0, device=device)
         transmatcher_acc = torch.tensor(0.0, device=device)
         
-        # Compute TransMatcher loss every step (changed from every 10 steps)
         if self.pairwise_matching_loss is not None:
             try:
-                # DEBUG: Print batch labels to verify PK sampling is working
-                if batch_idx < 50:  # Only print for first few batches
-                    unique_labels, counts = torch.unique(label, return_counts=True)
-                    print(f"[DEBUG] Batch {batch_idx}: Labels={label.cpu().numpy()}")
-                    print(f"[DEBUG] Batch {batch_idx}: Unique labels={unique_labels.cpu().numpy()}, Counts={counts.cpu().numpy()}")
-                    print(f"[DEBUG] Batch {batch_idx}: Has positive pairs={torch.any(counts > 1)}")
-                
                 # Update the matcher in pairwise loss
                 self.pairwise_matching_loss.matcher = transmatcher
                 
-                # Compute TransMatcher loss
+                # Compute TransMatcher loss using the original pairwise loss
                 transmatcher_loss, transmatcher_acc = self.pairwise_matching_loss(feature_maps, label)
-                
-                # DEBUG: Print loss values
-                if batch_idx < 50:
-                    print(f"[DEBUG] Batch {batch_idx}: TransMatcher loss={transmatcher_loss.mean().item():.6f}")
-                    print(f"[DEBUG] Batch {batch_idx}: TransMatcher acc={transmatcher_acc.mean().item():.6f}")
-                    print(f"[DEBUG] Batch {batch_idx}: Loss shape={transmatcher_loss.shape}, Acc shape={transmatcher_acc.shape}")
                 
                 # Check for NaN in TransMatcher loss
                 if torch.isnan(transmatcher_loss).any():
@@ -247,28 +234,45 @@ class Trainer(pl.LightningModule):
                 transmatcher_acc = torch.tensor(0.0, device=device)
         
         # Combined loss (weighted)
-        total_loss = adaface_loss + 0.5 * transmatcher_loss.mean()
+        total_loss = adaface_loss + 0.01 * transmatcher_loss.mean()  # Reduced from 0.05 to 0.01 for better stability
         
         # Log metrics
         lr = self.get_current_lr()
         self.log('lr', lr, on_step=True, on_epoch=True, logger=True)
         self.log('train_loss', total_loss, on_step=True, on_epoch=True, logger=True, prog_bar=True)
         self.log('adaface_loss', adaface_loss, on_step=True, on_epoch=True, logger=True, prog_bar=True)
-        self.log('transmatcher_loss', transmatcher_loss.mean(), on_step=True, on_epoch=True, logger=True, prog_bar=True)
-        self.log('transmatcher_acc', transmatcher_acc.mean(), on_step=True, on_epoch=True, logger=True)
+        self.log('transmatcher_loss', transmatcher_loss.mean(), on_step=True, on_epoch=True, logger=True, prog_bar=True)  # Need .mean()
+        self.log('transmatcher_acc', transmatcher_acc.mean(), on_step=True, on_epoch=True, logger=True)  # Need .mean()
         
         # Log to wandb
         wandb.log({
             "adaface_loss": adaface_loss.item(),
-            "transmatcher_loss": transmatcher_loss.mean().item(),
-            "transmatcher_acc": transmatcher_acc.mean().item(),
+            "transmatcher_loss": transmatcher_loss.mean().item(),  # Need .mean()
+            "transmatcher_acc": transmatcher_acc.mean().item(),  # Need .mean()
             "total_loss": total_loss.item(),
             "learning_rate": lr,
         })
 
-        # Clean up memory
+        # Manual optimization
+        self.manual_backward(total_loss)
+        
+        # Add gradient clipping to prevent NaN gradients
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+        
+        # Check for NaN gradients and zero them out
+        for name, param in self.named_parameters():
+            if param.grad is not None and torch.isnan(param.grad).any():
+                print(f"[TRAIN_STEP] WARNING: NaN gradients detected in {name} and zeroed out")
+                param.grad.data.zero_()
+        
+        self.optimizers().step()
+        self.optimizers().zero_grad()
+        
+        # Aggressive memory cleanup
         del embedding, norm, feature_maps, cos_thetas, adaface_loss, transmatcher_loss, transmatcher
         torch.cuda.empty_cache()
+        import gc
+        gc.collect()
 
         return total_loss
 
@@ -347,31 +351,22 @@ class Trainer(pl.LightningModule):
             }
 
     def validation_epoch_end(self, outputs):
-        print(f"[VALIDATION] Starting validation_epoch_end with {len(outputs)} outputs")
-        
         # Group outputs by dataname to process one validation set at a time
         dataname_to_idx = {"agedb_30": 0, "cfp_fp": 1, "lfw": 2, "cplfw": 3, "calfw": 4}
         idx_to_dataname = {val: key for key, val in dataname_to_idx.items()}
         val_logs = {}
         
-        print(f"[VALIDATION] Processing validation outputs...")
-        
         for dataname_idx in outputs[0]['dataname'].unique():
             dataname = idx_to_dataname[dataname_idx.item()]
-            print(f"[VALIDATION] Processing dataset: {dataname}")
             
-            # Filter outputs for this dataset - fix tensor comparison for multi-element tensors
-            list_of_outputs = [out for out in outputs if torch.all(out['dataname'] == dataname_idx)]
-            print(f"[VALIDATION] Found {len(list_of_outputs)} outputs for {dataname}")
+            # Filter outputs for this dataset
+            list_of_outputs = [out for out in outputs if out['dataname'] == dataname_idx]
             
             # Concatenate all tensors for the current dataset
             all_embeds = torch.cat([out['adaface_output'] for out in list_of_outputs], axis=0).numpy()
             all_norms = torch.cat([out['norm'] for out in list_of_outputs], axis=0).numpy()
             all_feature_maps = torch.cat([out['qaconv_output'] for out in list_of_outputs], axis=0)
             all_labels = torch.cat([out['target'] for out in list_of_outputs], axis=0).numpy().astype(bool)
-
-            print(f"[VALIDATION] {dataname} - AdaFace embeddings shape: {all_embeds.shape}")
-            print(f"[VALIDATION] {dataname} - Feature maps shape: {all_feature_maps.shape}")
 
             # Check for NaN in AdaFace embeddings (only occasionally to save performance)
             if np.isnan(all_embeds).any():
@@ -389,98 +384,82 @@ class Trainer(pl.LightningModule):
             if np.isnan(adaface_embeddings).any():
                 adaface_embeddings = np.nan_to_num(adaface_embeddings, nan=0.0)
             
-            print(f"[VALIDATION] {dataname} - Evaluating AdaFace...")
             tpr, fpr, accuracy, _ = evaluate_utils.evaluate(adaface_embeddings, all_labels, nrof_folds=10)
             adaface_acc = accuracy.mean()
             val_logs[f'{dataname}_adaface_acc'] = adaface_acc
-            print(f"[VALIDATION] {dataname} - AdaFace accuracy: {adaface_acc:.4f}")
 
             # --- Evaluate TransMatcher ---
-            print(f"[VALIDATION] {dataname} - Evaluating TransMatcher...")
-            try:
-                # For TransMatcher evaluation, we need to compute similarity scores
-                # Convert feature maps to the format expected by TransMatcher
-                feature_maps_perm = all_feature_maps.permute(0, 2, 3, 1).contiguous()  # (B, C, H, W) -> (B, H, W, C)
+            # For TransMatcher evaluation, we need to compute similarity scores
+            # Convert feature maps to the format expected by TransMatcher
+            feature_maps_perm = all_feature_maps.permute(0, 2, 3, 1).contiguous()  # (B, C, H, W) -> (B, H, W, C)
+            
+            # Check for NaN in feature maps before TransMatcher processing (only occasionally)
+            if torch.isnan(feature_maps_perm).any():
+                feature_maps_perm = torch.nan_to_num(feature_maps_perm, nan=0.0)
+                # Force normalization again
+                fm_flat = feature_maps_perm.view(feature_maps_perm.size(0), -1)
+                feature_maps_perm = torch.nn.functional.normalize(fm_flat, p=2, dim=1).view_as(feature_maps_perm)
+            
+            # Compute TransMatcher scores for positive and negative pairs
+            device = feature_maps_perm.device
+            num_pairs = len(feature_maps_perm) // 2
+            
+            # Get gallery and query features
+            gallery_features = feature_maps_perm[0::2]  # Even indices
+            query_features = feature_maps_perm[1::2]    # Odd indices
+            
+            # Compute positive pair scores (same identity)
+            positive_scores = self.model.transmatcher.match_pairs(query_features, gallery_features)
+            
+            # Check for NaN in positive scores (only occasionally)
+            if torch.isnan(positive_scores).any():
+                positive_scores = torch.nan_to_num(positive_scores, nan=0.0)
+            
+            # Compute negative pair scores (different identity) - use shifted indices
+            negative_scores = torch.zeros(num_pairs, device=device)
+            for i in range(0, num_pairs, 32):  # Process in batches
+                end_idx = min(i + 32, num_pairs)
+                batch_size = end_idx - i
                 
-                # Check for NaN in feature maps before TransMatcher processing (only occasionally)
-                if torch.isnan(feature_maps_perm).any():
-                    feature_maps_perm = torch.nan_to_num(feature_maps_perm, nan=0.0)
-                    # Force normalization again
-                    fm_flat = feature_maps_perm.view(feature_maps_perm.size(0), -1)
-                    feature_maps_perm = torch.nn.functional.normalize(fm_flat, p=2, dim=1).view_as(feature_maps_perm)
+                # Shift indices to get different identities
+                shifted_indices = (torch.arange(batch_size, device=device) + num_pairs // 2) % num_pairs
+                shifted_queries = query_features[shifted_indices]
+                batch_galleries = gallery_features[i:end_idx]
                 
-                # Compute TransMatcher scores for positive and negative pairs
-                device = feature_maps_perm.device
-                num_pairs = len(feature_maps_perm) // 2
-                
-                # Get gallery and query features
-                gallery_features = feature_maps_perm[0::2]  # Even indices
-                query_features = feature_maps_perm[1::2]    # Odd indices
-                
-                print(f"[VALIDATION] {dataname} - Computing positive pair scores...")
-                # Compute positive pair scores (same identity)
-                positive_scores = self.model.transmatcher.match_pairs(query_features, gallery_features)
-                
-                # Check for NaN in positive scores (only occasionally)
-                if torch.isnan(positive_scores).any():
-                    positive_scores = torch.nan_to_num(positive_scores, nan=0.0)
-                
-                print(f"[VALIDATION] {dataname} - Computing negative pair scores...")
-                # Compute negative pair scores (different identity) - use shifted indices
-                negative_scores = torch.zeros(num_pairs, device=device)
-                for i in range(0, num_pairs, 32):  # Process in batches
-                    end_idx = min(i + 32, num_pairs)
-                    batch_size = end_idx - i
-                    
-                    # Shift indices to get different identities
-                    shifted_indices = (torch.arange(batch_size, device=device) + num_pairs // 2) % num_pairs
-                    shifted_queries = query_features[shifted_indices]
-                    batch_galleries = gallery_features[i:end_idx]
-                    
-                    for j in range(batch_size):
-                        score = self.model.transmatcher(batch_galleries[j:j+1], shifted_queries[j:j+1])
-                        negative_scores[i + j] = score.view(-1)[0]
-                
-                # Check for NaN in negative scores (only occasionally)
-                if torch.isnan(negative_scores).any():
-                    negative_scores = torch.nan_to_num(negative_scores, nan=0.0)
-                
-                # Combine scores and convert to distances
-                all_scores = torch.cat([positive_scores, negative_scores])
-                
-                # Final check for NaN in all scores (only occasionally)
-                if torch.isnan(all_scores).any():
-                    all_scores = torch.nan_to_num(all_scores, nan=0.0)
-                
-                distances = -all_scores.cpu().numpy()  # Convert similarity to distance
-                
-                # Check for NaN in distances after numpy conversion (only occasionally)
-                if np.isnan(distances).any():
-                    distances = np.nan_to_num(distances, nan=0.0)
-                
-                # Evaluate TransMatcher
-                tpr, fpr, accuracy, _ = evaluate_utils.evaluate(distances.reshape(-1, 1), all_labels, nrof_folds=10)
-                trans_acc = accuracy.mean()
-                val_logs[f'{dataname}_trans_acc'] = trans_acc
-                print(f"[VALIDATION] {dataname} - TransMatcher accuracy: {trans_acc:.4f}")
+                for j in range(batch_size):
+                    score = self.model.transmatcher(batch_galleries[j:j+1], shifted_queries[j:j+1])
+                    negative_scores[i + j] = score.view(-1)[0]
+            
+            # Check for NaN in negative scores (only occasionally)
+            if torch.isnan(negative_scores).any():
+                negative_scores = torch.nan_to_num(negative_scores, nan=0.0)
+            
+            # Combine scores and convert to distances
+            all_scores = torch.cat([positive_scores, negative_scores])
+            
+            # Final check for NaN in all scores (only occasionally)
+            if torch.isnan(all_scores).any():
+                all_scores = torch.nan_to_num(all_scores, nan=0.0)
+            
+            distances = -all_scores.cpu().numpy()  # Convert similarity to distance
+            
+            # Check for NaN in distances after numpy conversion (only occasionally)
+            if np.isnan(distances).any():
+                distances = np.nan_to_num(distances, nan=0.0)
+            
+            # Evaluate TransMatcher
+            tpr, fpr, accuracy, _ = evaluate_utils.evaluate(distances.reshape(-1, 1), all_labels, nrof_folds=10)
+            trans_acc = accuracy.mean()
+            val_logs[f'{dataname}_trans_acc'] = trans_acc
 
-                val_logs[f'{dataname}_combined_acc'] = (adaface_acc + trans_acc) / 2.0
-                
-            except Exception as e:
-                print(f"[VALIDATION] {dataname} - Error in TransMatcher evaluation: {e}")
-                val_logs[f'{dataname}_trans_acc'] = 0.0
-                val_logs[f'{dataname}_combined_acc'] = adaface_acc
+            val_logs[f'{dataname}_combined_acc'] = (adaface_acc + trans_acc) / 2.0
             
             # Explicitly free memory
-            del all_embeds, all_norms, all_feature_maps
-            if 'feature_maps_perm' in locals():
-                del feature_maps_perm, gallery_features, query_features
-            if 'positive_scores' in locals():
-                del positive_scores, negative_scores, all_scores, distances
+            del all_embeds, all_norms, all_feature_maps, feature_maps_perm, gallery_features, query_features
+            del positive_scores, negative_scores, all_scores, distances
             import gc
             gc.collect()
 
-        print(f"[VALIDATION] Computing average accuracies...")
         # average accuracies across datasets
         val_logs['val_adaface_acc'] = np.mean([
             val_logs[f'{dataname}_adaface_acc'] for dataname in dataname_to_idx.keys() 
@@ -500,14 +479,12 @@ class Trainer(pl.LightningModule):
         # Add val_acc for ModelCheckpoint to monitor (use the combined accuracy)
         val_logs['val_acc'] = val_logs['val_combined_acc']
 
-        print(f"[VALIDATION] Logging metrics...")
         # Log all metrics in one place
         self.log('val_adaface_acc_epoch', val_logs['val_adaface_acc'], on_step=False, on_epoch=True, logger=True, prog_bar=True, sync_dist=True)
         self.log('val_trans_acc_epoch', val_logs['val_trans_acc'], on_step=False, on_epoch=True, logger=True, prog_bar=True, sync_dist=True)
         self.log('val_combined_acc_epoch', val_logs['val_combined_acc'], on_step=False, on_epoch=True, logger=True, prog_bar=True, sync_dist=True)
         self.log('val_combined_acc', val_logs['val_combined_acc'], on_step=False, on_epoch=True, logger=True, prog_bar=False, sync_dist=True)
 
-        print(f"[VALIDATION] Validation completed successfully!")
         return None
     
     def test_epoch_end(self, outputs):
@@ -579,7 +556,7 @@ class Trainer(pl.LightningModule):
         # Create optimizer with different learning rates
         optimizer = torch.optim.SGD([
             {'params': backbone_params + head_params, 'lr': self.hparams.lr, 'weight_decay': 5e-4},
-            {'params': transmatcher_params, 'lr': self.hparams.lr * 0.0001, 'weight_decay': 5e-4},
+            {'params': transmatcher_params, 'lr': self.hparams.lr * 0.1, 'weight_decay': 5e-4},
             {'params': bn_params, 'lr': self.hparams.lr, 'weight_decay': 0}
         ])
         
@@ -590,12 +567,4 @@ class Trainer(pl.LightningModule):
             gamma=self.hparams.lr_gamma
         )
         
-        # Add gradient clipping
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val_combined_acc_epoch",
-            },
-            "gradient_clip_val": 1.0,
-        }
+        return [optimizer], [scheduler]

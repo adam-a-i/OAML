@@ -51,68 +51,66 @@ class PairwiseMatchingLoss(Module):
         # Make sure feature tensors are proper trainable tensors (not inference tensors)
         feature = feature.detach().clone().requires_grad_(True)
         
-        try:
-            # Calculate matching scores
-            # For TransMatcher, we need to set memory first, then call forward
-            self.matcher.make_kernel(feature)
-            score = self.matcher(feature)  # [b, b]
-            
-            target1 = target.unsqueeze(1)
-            mask = (target1 == target1.t())
-            pair_labels = mask.float()
-            
-            loss = F.binary_cross_entropy_with_logits(score, pair_labels, reduction='none')
-            loss = loss.sum(-1)
+        # Calculate matching scores
+        # For TransMatcher, we need to set memory first, then call forward
+        self.matcher.make_kernel(feature)
+        score = self.matcher(feature)  # [b, b]
+        
+        # Clamp scores for numerical stability (important for 16-bit precision)
+        score = torch.clamp(score, min=-10, max=10)
+        
+        target1 = target.unsqueeze(1)
+        mask = (target1 == target1.t())
+        pair_labels = mask.float()
+        
+        # Debug information
+        unique_labels = torch.unique(target)
+        num_positive_pairs = (pair_labels == 1).sum().item()
+        num_negative_pairs = (pair_labels == 0).sum().item()
+        
+        print(f"[PAIRWISE_LOSS DEBUG] Unique labels in batch: {unique_labels.cpu().numpy()}")
+        print(f"[PAIRWISE_LOSS DEBUG] Pairwise mask sum: {num_positive_pairs} / {pair_labels.numel()}")
+        print(f"[PAIRWISE_LOSS DEBUG] Pairwise mask (first 10x10):")
+        print(pair_labels[:10, :10].cpu().numpy())
+        
+        loss = F.binary_cross_entropy_with_logits(score, pair_labels, reduction='none')
+        loss = loss.sum(-1)
 
-            with torch.no_grad():
-                # Fixed accuracy calculation for PK sampling
-                # For each sample, check if it has higher scores for same-class pairs than different-class pairs
-                accuracies = []
+        with torch.no_grad():
+            # Fixed accuracy calculation for PK sampling
+            # For each sample, check if it has higher scores for same-class pairs than different-class pairs
+            accuracies = []
+            
+            for i in range(score.size(0)):
+                # Get scores for this sample
+                sample_scores = score[i]  # [batch_size]
                 
-                for i in range(score.size(0)):
-                    # Get scores for this sample
-                    sample_scores = score[i]  # [batch_size]
-                    
-                    # Get positive and negative pairs for this sample
-                    positive_mask = pair_labels[i] == 1  # [batch_size]
-                    negative_mask = pair_labels[i] == 0  # [batch_size]
-                    
-                    # Exclude self-comparison
-                    positive_mask[i] = False
-                    negative_mask[i] = False
-                    
-                    if positive_mask.sum() > 0 and negative_mask.sum() > 0:
-                        # Get positive and negative scores
-                        positive_scores = sample_scores[positive_mask]
-                        negative_scores = sample_scores[negative_mask]
-                        
-                        # Check if max positive score > max negative score
-                        max_pos = positive_scores.max()
-                        max_neg = negative_scores.max()
-                        
-                        accuracy = (max_pos > max_neg).float()
-                        accuracies.append(accuracy)
-                    else:
-                        # If no positive or negative pairs, assign random accuracy
-                        accuracies.append(torch.tensor(0.5, device=device))
+                # Get positive and negative pairs for this sample
+                positive_mask = pair_labels[i] == 1  # [batch_size]
+                negative_mask = pair_labels[i] == 0  # [batch_size]
                 
-                acc = torch.stack(accuracies)
+                # Exclude self-comparison
+                positive_mask[i] = False
+                negative_mask[i] = False
+                
+                if positive_mask.sum() > 0 and negative_mask.sum() > 0:
+                    # Get positive and negative scores
+                    positive_scores = sample_scores[positive_mask]
+                    negative_scores = sample_scores[negative_mask]
+                    
+                    # Check if max positive score > max negative score
+                    max_pos = positive_scores.max()
+                    max_neg = negative_scores.max()
+                    
+                    accuracy = (max_pos > max_neg).float()
+                    accuracies.append(accuracy)
+                else:
+                    # If no positive or negative pairs, assign random accuracy
+                    accuracies.append(torch.tensor(0.5, device=device))
             
-            # Restore matcher's previous training state
-            self.matcher.train(training_state)
-            
-            return loss, acc
-            
-        except Exception as e:
-            print(f"[PAIRWISE_LOSS] ERROR: {e}")
-            import traceback
-            traceback.print_exc()
-            # Return zero loss and random accuracy on error
-            batch_size = feature.size(0)
-            loss = torch.zeros(batch_size, device=device)
-            acc = torch.full((batch_size,), 0.5, device=device)
-            
-            # Restore matcher's previous training state
-            self.matcher.train(training_state)
-            
-            return loss, acc
+            acc = torch.stack(accuracies)
+        
+        # Restore matcher's previous training state
+        self.matcher.train(training_state)
+        
+        return loss, acc
