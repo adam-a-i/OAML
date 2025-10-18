@@ -38,14 +38,13 @@ def main(args):
     params = inspect.signature(pl.Trainer).parameters.values()
     if 'strategy' in [param.name for param in params]:
         # recent pytorch lightning
-        trainer = pl.Trainer(resume_from_checkpoint=resume_from_checkpoint,
-                             default_root_dir=hparams.output_dir,
+        trainer = pl.Trainer(default_root_dir=hparams.output_dir,
                              logger=my_loggers,
-                             gpus=hparams.gpus,
+                             devices=hparams.gpus if hparams.gpus > 0 else 'auto',
                              max_epochs=hparams.epochs,
                              accelerator='cpu' if hparams.gpus == 0 else 'gpu',
-                             strategy=hparams.distributed_backend,
-                             precision=16 if hparams.use_16bit else 32,
+                             strategy='ddp_find_unused_parameters_true' if hparams.distributed_backend == 'ddp' else hparams.distributed_backend,
+                             precision='16-mixed' if hparams.use_16bit else '32-true',
                              fast_dev_run=hparams.fast_dev_run,
                              callbacks=[checkpoint_callback],
                              num_sanity_val_steps=16 if hparams.batch_size > 63 else 100,
@@ -55,13 +54,12 @@ def main(args):
                              )
     else:
         # pytorch lightning before 1.4.4
-        trainer = pl.Trainer(resume_from_checkpoint=resume_from_checkpoint,
-                             default_root_dir=hparams.output_dir,
+        trainer = pl.Trainer(default_root_dir=hparams.output_dir,
                              logger=my_loggers,
-                             gpus=hparams.gpus,
+                             devices=hparams.gpus if hparams.gpus > 0 else 'auto',
                              max_epochs=hparams.epochs,
-                             accelerator=hparams.distributed_backend,
-                             precision=16 if hparams.use_16bit else 32,
+                             accelerator='ddp_find_unused_parameters_true' if hparams.distributed_backend == 'ddp' else hparams.distributed_backend,
+                             precision='16-mixed' if hparams.use_16bit else '32-true',
                              fast_dev_run=hparams.fast_dev_run,
                              callbacks=[checkpoint_callback],
                              num_sanity_val_steps=16 if hparams.batch_size > 63 else 100,
@@ -73,7 +71,7 @@ def main(args):
     if not hparams.evaluate:
         # train / val
         print('start training')
-        trainer.fit(trainer_mod, data_mod)
+        trainer.fit(trainer_mod, data_mod, ckpt_path=resume_from_checkpoint)
         print('start evaluating')
         print('evaluating from ', checkpoint_callback.best_model_path)
         trainer.test(ckpt_path='best', datamodule=data_mod)

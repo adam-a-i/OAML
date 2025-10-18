@@ -60,8 +60,18 @@ class QAConv(Module):
         self.logit_bn.reset_parameters()
         with torch.no_grad():
             self.fc.weight.fill_(1. / (self.height * self.width))
-        # Reset class neighbors when parameters are reset
-        self.class_neighbors = None
+    
+    def make_kernel(self, features):
+        """
+        Set up kernel/memory for matching. This method is expected by PairwiseMatchingLoss.
+        For QAConv, we don't need to store anything, but we need this method for compatibility.
+        
+        Args:
+            features: [B, C, H, W] feature maps
+        """
+        # QAConv doesn't need to store kernel/memory like TransMatcher
+        # This method exists for compatibility with PairwiseMatchingLoss
+        pass
 
     def clone(self):
         """Create a fresh clone of this module"""
@@ -115,7 +125,41 @@ class QAConv(Module):
             _, indices = similarity_matrix.topk(k=self.k_nearest + 1, dim=1)
             self.class_neighbors = indices[:, 1:].contiguous()
 
-    def _compute_similarity_batch(self, prob_fea, gal_fea):
+    def apply_occlusion_weight(self, similarity, query_occ, gallery_occ, method="scaling"):
+        """
+        Apply occlusion-aware weighting to similarity scores.
+        
+        Args:
+            similarity: [B_probe, B_gallery, hw, hw] similarity tensor from correlation
+            query_occ: [B_probe, 1, H, W] query occlusion confidence map (1=visible, 0=occluded)
+            gallery_occ: [B_gallery, 1, H, W] gallery occlusion confidence map (1=visible, 0=occluded)
+            method: "scaling" (efficient) or "outer" (full outer product)
+        
+        Returns:
+            weighted_similarity: [B_probe, B_gallery, hw, hw] occlusion-weighted similarity
+        """
+        B_probe, B_gallery, hw_query, hw_gallery = similarity.shape
+        
+        # Flatten occlusion maps to match hw dimensions: [B, 1, H, W] -> [B, hw]
+        query_flat = query_occ.view(B_probe, -1)      # [B_probe, hw]
+        gallery_flat = gallery_occ.view(B_gallery, -1) # [B_gallery, hw]
+        
+        if method == "outer":
+            # Full outer-product mask: each query location weighted by all gallery locations
+            # Reshape for broadcasting: [B_probe, hw, 1] * [B_gallery, 1, hw] -> [B_probe, B_gallery, hw, hw]
+            q_weight = query_flat.unsqueeze(1).unsqueeze(3)     # [B_probe, 1, hw, 1]
+            g_weight = gallery_flat.unsqueeze(0).unsqueeze(2)   # [1, B_gallery, 1, hw]
+            weight = q_weight * g_weight                         # [B_probe, B_gallery, hw, hw]
+        else:  # scaling method (more efficient and stable)
+            # Scale by query visibility and gallery visibility
+            # Reshape for broadcasting: [B_probe, hw, 1] * [B_gallery, 1, hw] -> [B_probe, B_gallery, hw, hw]
+            q_weight = query_flat.unsqueeze(1).unsqueeze(3)     # [B_probe, 1, hw, 1]
+            g_weight = gallery_flat.unsqueeze(0).unsqueeze(2)   # [1, B_gallery, 1, hw]
+            weight = q_weight * g_weight                         # [B_probe, B_gallery, hw, hw]
+        
+        return similarity * weight
+
+    def _compute_similarity_batch(self, prob_fea, gal_fea, query_occ=None, gallery_occ=None, occlusion_method="scaling"):
         """Compute similarity between probe and gallery features"""
         # Get shapes and verify dimensions
         prob_size = prob_fea.size(0)
@@ -147,6 +191,10 @@ class QAConv(Module):
                 score[i:end_i, j:end_j] = torch.einsum('p c s, g c r -> p g r s', 
                                                        prob_chunk, gal_chunk)
         
+        # Apply occlusion weighting if occlusion maps are provided
+        if query_occ is not None and gallery_occ is not None:
+            score = self.apply_occlusion_weight(score, query_occ, gallery_occ, occlusion_method)
+        
         # Max pooling over spatial dimensions - operate on full tensor at once
         max_r = score.max(dim=2)[0]  # [p, g, s]
         max_s = score.max(dim=3)[0]  # [p, g, r]
@@ -163,7 +211,7 @@ class QAConv(Module):
         
         return score
 
-    def forward(self, prob_fea, gal_fea=None, labels=None):
+    def forward(self, prob_fea, gal_fea=None, labels=None, query_occ=None, gallery_occ=None, occlusion_method="scaling"):
         """
         Forward pass supporting both training and inference modes
         
@@ -173,6 +221,9 @@ class QAConv(Module):
                     If None, use class embeddings (training mode)
             labels: Class labels for each sample in the batch [batch_size]
                     If provided, enables class-level neighbor computation
+            query_occ: Query occlusion maps (optional) [batch_size, 1, height, width]
+            gallery_occ: Gallery occlusion maps (optional) [batch_size, 1, height, width]
+            occlusion_method: "scaling" or "outer" for occlusion weighting method
         
         Returns:
             Similarity scores between probe and gallery features
@@ -245,13 +296,13 @@ class QAConv(Module):
                         if len(sample_indices) == 1:
                             # Single sample case - simpler processing
                             sample = class_samples
-                            sample_scores = self._compute_similarity_batch(sample, neighbor_embeds)
+                            sample_scores = self._compute_similarity_batch(sample, neighbor_embeds, None, None, occlusion_method)
                             # Ensure dtypes match when assigning
                             all_scores[sample_indices[0], neighbors] = sample_scores.to(dtype=all_scores.dtype).view(-1)
                         else:
                             # Multiple samples case - batch together
                             # Compute pairwise scores for all samples against all neighbors
-                            sample_scores = self._compute_similarity_batch(class_samples, neighbor_embeds)
+                            sample_scores = self._compute_similarity_batch(class_samples, neighbor_embeds, None, None, occlusion_method)
                             
                             # Assign scores to each sample - ensure dtypes match
                             for j, idx in enumerate(sample_indices):
@@ -289,7 +340,7 @@ class QAConv(Module):
                     sample_neighbors = neighbor_embeds[i]
                     
                     # Compute similarity for this sample against its neighbors
-                    scores = self._compute_similarity_batch(sample, sample_neighbors)
+                    scores = self._compute_similarity_batch(sample, sample_neighbors, None, None, occlusion_method)
                     
                     # Assign scores to correct positions
                     all_scores[start + i, curr_neighbors[i]] = scores.view(-1)
@@ -310,7 +361,7 @@ class QAConv(Module):
             if gal_fea is not prob_fea:  # Skip if gal_fea is the same object as prob_fea
                 gal_fea = F.normalize(gal_fea, p=2, dim=1)
             
-            return self._compute_similarity_batch(prob_fea, gal_fea)
+            return self._compute_similarity_batch(prob_fea, gal_fea, query_occ, gallery_occ, occlusion_method)
         
         return None
 
@@ -329,7 +380,7 @@ class QAConv(Module):
             self.class_neighbors = None
             self.compute_class_neighbors() 
 
-    def match_pairs(self, probe_features, gallery_features):
+    def match_pairs(self, probe_features, gallery_features, query_occ=None, gallery_occ=None, occlusion_method="scaling"):
         """
         Match probe-gallery pairs directly during validation.
         This is a simplified version of forward() specifically for validation.
@@ -338,6 +389,9 @@ class QAConv(Module):
         Args:
             probe_features: Features from probe images [batch_size, num_features, height, width]
             gallery_features: Features from gallery images [batch_size, num_features, height, width]
+            query_occ: Query occlusion maps (optional) [batch_size, 1, height, width]
+            gallery_occ: Gallery occlusion maps (optional) [batch_size, 1, height, width]
+            occlusion_method: "scaling" or "outer" for occlusion weighting method
             
         Returns:
             Similarity scores between probe and gallery pairs [batch_size]
@@ -390,6 +444,12 @@ class QAConv(Module):
                     
                     # Compute correlation efficiently
                     corr = torch.einsum('p c s, g c r -> p g r s', p_fea, g_fea)
+                    
+                    # Apply occlusion weighting if available
+                    if query_occ is not None and gallery_occ is not None:
+                        single_query_occ = query_occ[start + i:start + i + 1]  # [1, 1, H, W]
+                        single_gallery_occ = gallery_occ[start + i:start + i + 1]  # [1, 1, H, W]
+                        corr = self.apply_occlusion_weight(corr, single_query_occ, single_gallery_occ, occlusion_method)
                     
                     # Max pooling
                     max_r = corr.max(dim=2)[0]  # [1, 1, s]

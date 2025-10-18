@@ -155,8 +155,8 @@ def main():
     with torch.no_grad():
         for imgs, labs in tqdm(loader, desc="Feature Extraction"):
             imgs = imgs.to(device)
-            # Get AdaFace embeddings
-            embeddings, norms = model(imgs)
+            # Get AdaFace embeddings (model now returns 3 values: embeddings, norms, occlusion_maps)
+            embeddings, norms, _ = model(imgs)  # Ignore occlusion maps for evaluation
             adaface_feats_list.append(embeddings.cpu())
             
             # Get QAConv feature maps if available

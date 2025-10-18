@@ -96,6 +96,13 @@ class AugmentRecordDataset(BaseMXDataset):
             cv2.imwrite(sample_save_path, np.array(sample))  # the result has to look okay (Not color swapped)
 
         if self.transform is not None:
-            sample = self.transform(sample)
-
+            transform_result = self.transform(sample)
+            # Handle both regular transforms (return image) and occlusion transforms (return image, mask)
+            if isinstance(transform_result, tuple) and len(transform_result) == 2:
+                sample, mask = transform_result
+                return sample, target, mask
+            else:
+                sample = transform_result
+                return sample, target
+        
         return sample, target

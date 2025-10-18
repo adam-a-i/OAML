@@ -22,17 +22,25 @@ class Trainer(LightningModule):
         self.save_hyperparameters()  # sets self.hparams
         
         # Define weight variables before wandb initialization
-        # weight for qaconv loss 
-        self.qaconv_loss_weight = 0.9  
-        self.adaface_loss_weight = 1.0 - self.qaconv_loss_weight  
+        # Loss weights: QAConv=0.7, AdaFace=0.1, Occlusion=0.3 (total=1.1)
+        self.qaconv_loss_weight = 0.7
+        self.adaface_loss_weight = 0.1  
+        self.occlusion_loss_weight = 0.3  # Weight for occlusion supervision loss
         
         #weights for combining AdaFace and QAConv scores during evaluation
         self.adaface_eval_weight = 0.5  
         self.qaconv_eval_weight = 0.5   
         
+        # Occlusion-aware parameters
+        self.occlusion_method = "scaling"  # Method for occlusion weighting in QAConv
+        
+        # Store validation and test outputs for epoch end processing (newer PyTorch Lightning)
+        self.validation_step_outputs = []
+        self.test_step_outputs = []
+        
         # Initialize wandb
         wandb.init(
-            project="adaface_face_recognition",
+            project="aadaface_face_recognition_qaconv_segmentation",
                 config={
                     "architecture": self.hparams.arch,
                     "learning_rate": self.hparams.lr,
@@ -41,6 +49,8 @@ class Trainer(LightningModule):
                     "adaface_loss_weight": self.adaface_loss_weight,
                     "adaface_eval_weight": self.adaface_eval_weight,
                     "qaconv_eval_weight": self.qaconv_eval_weight,
+                    "occlusion_loss_weight": self.occlusion_loss_weight,
+                    "occlusion_method": self.occlusion_method,
                 "epochs": self.hparams.epochs if hasattr(self.hparams, 'epochs') else None,
                 "batch_size": self.hparams.batch_size if hasattr(self.hparams, 'batch_size') else None,
                 "k_nearest": self.hparams.k_nearest if hasattr(self.hparams, 'k_nearest') else None,
@@ -116,22 +126,35 @@ class Trainer(LightningModule):
         if scheduler is None:
             raise ValueError('lr calculation not successful')
 
-        if isinstance(scheduler, lr_scheduler._LRScheduler):
+        # Try different methods to get learning rate
+        if hasattr(scheduler, 'get_last_lr'):
             lr = scheduler.get_last_lr()[0]
+        elif hasattr(scheduler, 'get_lr'):
+            lr = scheduler.get_lr()[0] 
+        elif hasattr(scheduler, '_last_lr'):
+            lr = scheduler._last_lr[0]
         else:
-            lr = scheduler.get_epoch_values(self.current_epoch)[0]
+            # Fallback to optimizer's learning rate
+            lr = scheduler.optimizer.param_groups[0]['lr']
         return lr
 
     def forward(self, images, labels):
-        embeddings, norms = self.model(images)
+        embeddings, norms, occlusion_maps = self.model(images)
         cos_thetas = self.head(embeddings, norms, labels)
         if isinstance(cos_thetas, tuple):
             cos_thetas, bad_grad = cos_thetas
             labels[bad_grad.squeeze(-1)] = -100  # ignore_index
-        return cos_thetas, norms, embeddings, labels
+        return cos_thetas, norms, embeddings, occlusion_maps, labels
 
     def training_step(self, batch, batch_idx):
-        images, labels = batch
+        # Handle both regular batches and batches with occlusion masks
+        if len(batch) == 3:
+            # Batch with occlusion masks from SyntheticOcclusionMask transform
+            images, labels, gt_occlusion_masks = batch
+        else:
+            # Regular batch without occlusion masks
+            images, labels = batch
+            gt_occlusion_masks = None
         
         # --- Save sample augmented images in the first epoch ---
         if self.current_epoch == 0 and batch_idx < 3: # Save 3 sample batches
@@ -185,6 +208,9 @@ class Trainer(LightningModule):
         
         # Make deep copy of feature maps to avoid inference tensor issues
         feature_maps = feature_maps.clone().detach().requires_grad_(True)
+        
+        # Extract occlusion maps from the same feature maps
+        pred_occlusion_maps = self.model.occlusion_head(x)  # Use original x before normalization
         
         # Verify normalization
         norms = torch.norm(feature_maps.view(feature_maps.size(0), -1), p=2, dim=1)
@@ -258,10 +284,62 @@ class Trainer(LightningModule):
                 print(f"WARNING: AdaFace loss is NaN. Using zero loss instead.")
                 adaface_loss = torch.tensor(0.0, device=device)
             
+            # Compute occlusion supervision loss if ground truth masks are available
+            occlusion_loss = torch.tensor(0.0, device=device)
+            if gt_occlusion_masks is not None:
+                # Ensure ground truth masks are on the correct device
+                gt_occlusion_masks = gt_occlusion_masks.to(device)
+                
+                # Resize ground truth masks to match prediction size
+                # pred_occlusion_maps: [B, 1, 7, 7], gt_occlusion_masks: [B, 1, 112, 112]
+                pred_h, pred_w = pred_occlusion_maps.shape[2], pred_occlusion_maps.shape[3]
+                gt_h, gt_w = gt_occlusion_masks.shape[2], gt_occlusion_masks.shape[3]
+                
+                if (pred_h, pred_w) != (gt_h, gt_w):
+                    # Downsample ground truth to match prediction resolution
+                    gt_occlusion_masks = F.interpolate(
+                        gt_occlusion_masks, 
+                        size=(pred_h, pred_w), 
+                        mode='bilinear', 
+                        align_corners=False
+                    )
+                
+                # Now both tensors have the same shape: [B, 1, 7, 7]
+                occlusion_loss = F.mse_loss(pred_occlusion_maps, gt_occlusion_masks)
+                
+                # Check for NaN in occlusion loss
+                if torch.isnan(occlusion_loss):
+                    print(f"WARNING: Occlusion loss is NaN. Using zero loss instead.")
+                    occlusion_loss = torch.tensor(0.0, device=device)
+            
             # Combine losses
-            total_loss = self.adaface_loss_weight * adaface_loss + self.qaconv_loss_weight * qaconv_loss
+            total_loss = (self.adaface_loss_weight * adaface_loss + 
+                         self.qaconv_loss_weight * qaconv_loss + 
+                         self.occlusion_loss_weight * occlusion_loss)
         else:
-            total_loss = adaface_loss
+            # No QAConv - still compute occlusion loss if available
+            occlusion_loss = torch.tensor(0.0, device=device)
+            if gt_occlusion_masks is not None:
+                gt_occlusion_masks = gt_occlusion_masks.to(device)
+                
+                # Resize ground truth masks to match prediction size
+                pred_h, pred_w = pred_occlusion_maps.shape[2], pred_occlusion_maps.shape[3]
+                gt_h, gt_w = gt_occlusion_masks.shape[2], gt_occlusion_masks.shape[3]
+                
+                if (pred_h, pred_w) != (gt_h, gt_w):
+                    gt_occlusion_masks = F.interpolate(
+                        gt_occlusion_masks, 
+                        size=(pred_h, pred_w), 
+                        mode='bilinear', 
+                        align_corners=False
+                    )
+                
+                occlusion_loss = F.mse_loss(pred_occlusion_maps, gt_occlusion_masks)
+                if torch.isnan(occlusion_loss):
+                    print(f"WARNING: Occlusion loss is NaN. Using zero loss instead.")
+                    occlusion_loss = torch.tensor(0.0, device=device)
+            
+            total_loss = adaface_loss + self.occlusion_loss_weight * occlusion_loss
 
         # log metrics - ensure we take mean of tensor values
         lr = self.get_current_lr()
@@ -269,23 +347,54 @@ class Trainer(LightningModule):
         self.log('train_loss', total_loss.mean(), on_step=True, on_epoch=True, logger=True, prog_bar=True)
         self.log('adaface_loss', adaface_loss.mean(), on_step=True, on_epoch=True, logger=True, prog_bar=True)
         self.log('qaconv_loss', qaconv_loss, on_step=True, on_epoch=True, logger=True, prog_bar=True)
-        self.log('qaconv_acc', pairwise_acc.mean(), on_step=True, on_epoch=True, logger=True)
+        self.log('occlusion_loss', occlusion_loss, on_step=True, on_epoch=True, logger=True, prog_bar=True)
+        if self.qaconv_criterion is not None:
+            self.log('qaconv_acc', pairwise_acc.mean(), on_step=True, on_epoch=True, logger=True)
+        
+        # Debug: Log occlusion head weight norms every 1000 iterations
+        if self.global_step % 1000 == 0:
+            self._log_occlusion_head_norms()
         
         # Log to wandb
-        wandb.log({
+        wandb_log_dict = {
             "qaconv_loss": qaconv_loss.item(),
-            "qaconv_acc": pairwise_acc.mean().item(),
             "adaface_loss": adaface_loss.item(),
+            "occlusion_loss": occlusion_loss.item(),
             "total_loss": total_loss.mean().item(),
             "learning_rate": lr,
-            "qaconv_pairwise_loss": pairwise_loss.mean().item(), # Log pairwise loss to wandb
-            "qaconv_triplet_loss": triplet_loss.mean().item(), # Log triplet loss to wandb
-        })
+        }
+        
+        # Add occlusion head norm to wandb every 1000 steps
+        if self.global_step % 1000 == 0:
+            try:
+                total_norm = 0.0
+                param_count = 0
+                for name, param in self.model.named_parameters():
+                    if 'occlusion' in name.lower():
+                        total_norm += param.data.norm(2).item() ** 2
+                        param_count += 1
+                if param_count > 0:
+                    avg_norm = (total_norm ** 0.5) / param_count
+                    wandb_log_dict["occlusion_head_avg_norm"] = avg_norm
+                    wandb_log_dict["occlusion_head_param_count"] = param_count
+            except Exception as e:
+                print(f"Error computing occlusion head norm for wandb: {e}")
+        
+        # Add QAConv-specific metrics if available
+        if self.qaconv_criterion is not None:
+            wandb_log_dict.update({
+                "qaconv_acc": pairwise_acc.mean().item(),
+                "qaconv_pairwise_loss": pairwise_loss.mean().item(),
+                "qaconv_triplet_loss": triplet_loss.mean().item(),
+            })
+        
+        wandb.log(wandb_log_dict)
 
         return total_loss.mean()
 
-    def training_epoch_end(self, outputs):
-        return None
+    def on_train_epoch_end(self):
+        # New PyTorch Lightning API - no outputs parameter needed
+        pass
 
     def validation_step(self, batch, batch_idx):
         images, labels, dataname, image_index = batch
@@ -313,9 +422,9 @@ class Trainer(LightningModule):
             feature_maps = F.normalize(x, p=2, dim=1)
             
             # get adaface embeddings with flip augmentation
-            embeddings, norms = self.model(images)
+            embeddings, norms, _ = self.model(images)  # Ignore occlusion maps in validation
             fliped_images = torch.flip(images, dims=[3])
-            flipped_embeddings, flipped_norms = self.model(fliped_images)
+            flipped_embeddings, flipped_norms, _ = self.model(fliped_images)  # Ignore occlusion maps
             stacked_embeddings = torch.stack([embeddings, flipped_embeddings], dim=0)
             stacked_norms = torch.stack([norms, flipped_norms], dim=0)
             embeddings, norms = utils.fuse_features_with_norm(stacked_embeddings, stacked_norms)
@@ -333,7 +442,7 @@ class Trainer(LightningModule):
 
         if self.hparams.distributed_backend == 'ddp':
             # to save gpu memory
-            return {
+            output = {
                 'adaface_output': embeddings.to('cpu'),
                 'norm': norms.to('cpu'),
                 'qaconv_output': feature_maps.to('cpu'),
@@ -343,7 +452,7 @@ class Trainer(LightningModule):
             }
         else:
             # dp requires the tensor to be cuda
-            return {
+            output = {
                 'adaface_output': embeddings,
                 'norm': norms,
                 'qaconv_output': feature_maps,
@@ -351,8 +460,19 @@ class Trainer(LightningModule):
                 'dataname': dataname,
                 'image_index': image_index
             }
+        
+        # Store output for epoch end processing (newer PyTorch Lightning)
+        self.validation_step_outputs.append(output)
+        return output
 
-    def validation_epoch_end(self, outputs):
+    def on_validation_epoch_end(self):
+        # Use stored validation outputs (newer PyTorch Lightning approach)
+        outputs = self.validation_step_outputs
+        
+        if not outputs:
+            print("Warning: No validation outputs found, skipping validation epoch end")
+            return
+            
         all_adaface_tensor, all_norm_tensor, all_qaconv_tensor, all_target_tensor, all_dataname_tensor = self.gather_outputs(outputs)
 
         dataname_to_idx = {"agedb_30": 0, "cfp_fp": 1, "lfw": 2, "cplfw": 3, "calfw": 4}
@@ -648,12 +768,26 @@ class Trainer(LightningModule):
         for k, v in val_logs.items():
             self.log(name=k, value=v)
 
-        return None
+        # Clear validation outputs for next epoch (newer PyTorch Lightning)
+        self.validation_step_outputs.clear()
 
     def test_step(self, batch, batch_idx):
-        return self.validation_step(batch, batch_idx)
+        # Call validation_step logic but store in test outputs
+        output = self.validation_step(batch, batch_idx)
+        # Remove from validation outputs and add to test outputs
+        if self.validation_step_outputs and self.validation_step_outputs[-1] == output:
+            self.validation_step_outputs.pop()
+        self.test_step_outputs.append(output)
+        return output
 
-    def test_epoch_end(self, outputs):
+    def on_test_epoch_end(self):
+        # Use stored test outputs (newer PyTorch Lightning approach)
+        outputs = self.test_step_outputs
+        
+        if not outputs:
+            print("Warning: No test outputs found, skipping test epoch end")
+            return
+            
         all_adaface_tensor, all_norm_tensor, all_qaconv_tensor, all_target_tensor, all_dataname_tensor = self.gather_outputs(outputs)
 
         dataname_to_idx = {"agedb_30": 0, "cfp_fp": 1, "lfw": 2, "cplfw": 3, "calfw": 4}
@@ -941,7 +1075,8 @@ class Trainer(LightningModule):
         for k, v in test_logs.items():
             self.log(name=k, value=v)
 
-        return None
+        # Clear test outputs for next run (newer PyTorch Lightning)
+        self.test_step_outputs.clear()
 
     def gather_outputs(self, outputs):
         if self.hparams.distributed_backend == 'ddp':
@@ -1027,6 +1162,35 @@ class Trainer(LightningModule):
         
         return params_decay, params_no_decay
 
+    def _log_occlusion_head_norms(self):
+        """Log L2 norms of occlusion head weights for debugging parameter updates"""
+        try:
+            occlusion_norms = {}
+            total_norm = 0.0
+            param_count = 0
+            
+            for name, param in self.model.named_parameters():
+                if 'occlusion' in name.lower():
+                    param_norm = param.data.norm(2).item()
+                    occlusion_norms[f'occlusion_head/{name.replace(".", "_")}_norm'] = param_norm
+                    total_norm += param_norm ** 2
+                    param_count += 1
+            
+            if param_count > 0:
+                total_norm = (total_norm ** 0.5) / param_count  # Average L2 norm
+                occlusion_norms['occlusion_head/total_avg_norm'] = total_norm
+                occlusion_norms['occlusion_head/param_count'] = param_count
+                
+                # Log to wandb
+                self.logger.experiment.log(occlusion_norms, step=self.global_step)
+                
+                print(f"Step {self.global_step}: Occlusion head has {param_count} parameters, avg L2 norm: {total_norm:.6f}")
+            else:
+                print(f"Step {self.global_step}: No occlusion head parameters found!")
+                
+        except Exception as e:
+            print(f"Error logging occlusion head norms: {e}")
+
     def configure_optimizers(self):
         paras_wo_bn, paras_only_bn = self.split_parameters(self.model)
         
@@ -1035,6 +1199,22 @@ class Trainer(LightningModule):
             qaconv_paras_wo_bn, qaconv_paras_only_bn = self.split_parameters(self.qaconv)
             paras_wo_bn.extend(qaconv_paras_wo_bn)
             paras_only_bn.extend(qaconv_paras_only_bn)
+        
+        # Add Occlusion Head parameters if available
+        if hasattr(self.model, 'occlusion_head_112') or hasattr(self.model, 'occlusion_head_224'):
+            # Find occlusion head parameters
+            occlusion_paras_wo_bn, occlusion_paras_only_bn = [], []
+            for name, param in self.model.named_parameters():
+                if 'occlusion' in name.lower():
+                    if 'bn' in name.lower() or 'norm' in name.lower():
+                        occlusion_paras_only_bn.append(param)
+                    else:
+                        occlusion_paras_wo_bn.append(param)
+            
+            paras_wo_bn.extend(occlusion_paras_wo_bn)
+            paras_only_bn.extend(occlusion_paras_only_bn)
+            
+            print(f"Added {len(occlusion_paras_wo_bn)} occlusion head parameters to optimizer")
 
         optimizer = optim.SGD([{
             'params': paras_wo_bn + [self.head.kernel],

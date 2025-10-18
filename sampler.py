@@ -20,9 +20,18 @@ class RandomIdentitySampler(Sampler):
         self.data_source = data_source
         self.num_instances = num_instances
         self.index_dic = defaultdict(list)
-        for index, (_, label) in enumerate(data_source):
+        for index, sample in enumerate(data_source):
             if index % 1000 == 0: # Print progress every 1000 samples
                 print(f"DEBUG Sampler Init: Processing sample {index}")
+            
+            # Handle both 2-element (image, label) and 3-element (image, label, mask) returns
+            if len(sample) == 2:
+                _, label = sample
+            elif len(sample) == 3:
+                _, label, _ = sample  # (image, label, mask)
+            else:
+                raise ValueError(f"Dataset returned unexpected number of elements: {len(sample)}")
+                
             self.index_dic[label].append(index)
         self.pids = list(self.index_dic.keys())
         self.num_identities = len(self.pids)

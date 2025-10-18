@@ -4,11 +4,12 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 import numpy as np
 import pandas as pd
+from PIL import Image
 import evaluate_utils
 from dataset.image_folder_dataset import CustomImageFolderDataset
 from dataset.five_validation_dataset import FiveValidationDataset
 from dataset.record_dataset import AugmentRecordDataset
-from transforms import RandomOcclusion, MedicalMaskOcclusion
+from transforms import RandomOcclusion, MedicalMaskOcclusion, OcclusionMaskWrapper, ToTensorWithMask
 from sampler import RandomIdentitySampler
 
 
@@ -140,12 +141,27 @@ def train_dataset(data_root, train_data_path,
                   use_mxrecord,
                   output_dir):
 
-    train_transform = transforms.Compose([
-        transforms.RandomHorizontalFlip(),
-        MedicalMaskOcclusion(prob=0.5),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-    ])
+    # Create a custom transform pipeline that handles (image, mask) tuples
+    def custom_train_transform(img):
+        # Step 1: Random horizontal flip
+        if np.random.random() > 0.5:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+        
+        # Step 2: Apply medical mask occlusion (returns tuple)
+        mask_transform = MedicalMaskOcclusion(prob=0.5)
+        img, mask = mask_transform(img)
+        
+        # Step 3: Convert to tensors
+        tensor_transform = ToTensorWithMask()
+        img_tensor, mask_tensor = tensor_transform((img, mask))
+        
+        # Step 4: Normalize image (keep mask as is)
+        normalize = transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+        img_tensor = normalize(img_tensor)
+        
+        return img_tensor, mask_tensor
+    
+    train_transform = custom_train_transform
 
     if use_mxrecord:
         train_dir = os.path.join(data_root, train_data_path)

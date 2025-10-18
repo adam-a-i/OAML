@@ -13,6 +13,53 @@ from qaconv import QAConv
 import os
 import torch.nn.functional as F
 
+
+class OcclusionHead(Module):
+    """Occlusion prediction head that predicts confidence maps for feature visibility.
+    
+    Takes feature maps from CNN backbone and outputs per-spatial-location occlusion confidence.
+    Output values are in [0,1] where 1 = visible, 0 = occluded.
+    """
+    def __init__(self, in_channels, hidden_channels=256):
+        """
+        Args:
+            in_channels: Number of input feature channels (e.g., 512 for IR-50)
+            hidden_channels: Hidden layer channels for the prediction head
+        """
+        super(OcclusionHead, self).__init__()
+        self.conv = Sequential(
+            Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
+            BatchNorm2d(hidden_channels),
+            ReLU(inplace=True),
+            Conv2d(hidden_channels, 1, kernel_size=1, bias=True),  # Single channel confidence
+            Sigmoid()  # Values in [0,1]
+        )
+        
+        # Initialize weights for stable training
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """Initialize weights for stable occlusion prediction"""
+        for m in self.modules():
+            if isinstance(m, Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: Feature maps [B, in_channels, H, W]
+        
+        Returns:
+            occlusion_map: Confidence map [B, 1, H, W] where 1=visible, 0=occluded
+        """
+        return self.conv(x)
+
+
 def build_model(model_name='ir_50'):
     if model_name == 'ir_101':
         return IR_101(input_size=(112,112))
@@ -310,12 +357,16 @@ class Backbone(Module):
                                         Linear(output_channel * 7 * 7, 512),
                                         BatchNorm1d(512, affine=False))
             self.qaconv = QAConv(num_features=output_channel, height=7, width=7)
+            # Occlusion head for 7x7 feature maps
+            self.occlusion_head = OcclusionHead(in_channels=output_channel, hidden_channels=256)
         else:
             self.output_layer = Sequential(
                 BatchNorm2d(output_channel), Dropout(0.4), Flatten(),
                 Linear(output_channel * 14 * 14, 512),
                 BatchNorm1d(512, affine=False))
             self.qaconv = QAConv(num_features=output_channel, height=14, width=14)
+            # Occlusion head for 14x14 feature maps  
+            self.occlusion_head = OcclusionHead(in_channels=output_channel, hidden_channels=256)
 
         initialize_weights(self.modules())
         
@@ -371,6 +422,10 @@ class Backbone(Module):
                 
         feature_maps = x  # Store feature maps for QAConv
         
+        # Generate occlusion confidence map from feature maps
+        # Shape: [B, 1, H, W] where H,W match feature_maps spatial dimensions
+        occlusion_map = self.occlusion_head(feature_maps)
+        
         # Check norms of feature maps to ensure they're reasonable
         norms = torch.norm(feature_maps.view(feature_maps.size(0), -1), p=2, dim=1)
         print(f"Feature map norms - min: {norms.min().item():.6f}, max: {norms.max().item():.6f}")
@@ -391,9 +446,35 @@ class Backbone(Module):
         if self.training == False and hasattr(self, '_gallery_features'):
             # Use feature maps directly without normalization to avoid introducing NaNs
             qaconv_score = self.qaconv(feature_maps, self._gallery_features)
-            return output, norm, qaconv_score
+            return output, norm, occlusion_map, qaconv_score
+
+        return output, norm, occlusion_map
+    
+    def get_feature_maps(self, x):
+        """
+        Get feature maps from the backbone for QAConv processing.
+        This is a helper method for accessing intermediate feature representations.
         
-        return output, norm
+        Args:
+            x: Input tensor [B, C, H, W]
+            
+        Returns:
+            feature_maps: Feature maps before final embedding layer [B, D, H', W']
+        """
+        # Run through the backbone layers up to feature maps
+        x = self.input_layer(x)
+        x = self.body(x)
+        
+        # Handle potential numerical issues
+        if torch.isnan(x).any():
+            print("WARNING: Feature maps contain NaNs. Replacing with zeros.")
+            x = torch.nan_to_num(x, nan=0.0)
+            
+        # Ensure we don't have all-zero feature maps
+        if torch.sum(x.abs()) < 1e-4:
+            x = x + 1e-6  # Add small constant to prevent all zeros
+            
+        return x
 
     def set_gallery_features(self, gallery_features):
         """Store gallery features for QAConv matching"""
