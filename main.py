@@ -36,44 +36,80 @@ def main(args):
     resume_from_checkpoint = hparams.resume_from_checkpoint if hparams.resume_from_checkpoint else None
 
     params = inspect.signature(pl.Trainer).parameters.values()
-    if 'strategy' in [param.name for param in params]:
-        # recent pytorch lightning
-        trainer = pl.Trainer(resume_from_checkpoint=resume_from_checkpoint,
-                             default_root_dir=hparams.output_dir,
-                             logger=my_loggers,
-                             gpus=hparams.gpus,
-                             max_epochs=hparams.epochs,
-                             accelerator='cpu' if hparams.gpus == 0 else 'gpu',
-                             strategy=hparams.distributed_backend,
-                             precision=16 if hparams.use_16bit else 32,
-                             fast_dev_run=hparams.fast_dev_run,
-                             callbacks=[checkpoint_callback],
-                             num_sanity_val_steps=16 if hparams.batch_size > 63 else 100,
-                             val_check_interval=1.0 if hparams.epochs > 4 else 0.1,
-                             accumulate_grad_batches=hparams.accumulate_grad_batches,
-                             limit_train_batches=50 if hparams.test_run else 1.0
-                             )
+    param_names = [param.name for param in params]
+
+    # Check PL version by available parameters
+    # Determine strategy: use find_unused_parameters for DDP (needed for OcclusionHead)
+    if hparams.gpus > 1:
+        if hparams.distributed_backend == 'ddp':
+            strategy = 'ddp_find_unused_parameters_true'
+        else:
+            strategy = hparams.distributed_backend
     else:
-        # pytorch lightning before 1.4.4
-        trainer = pl.Trainer(resume_from_checkpoint=resume_from_checkpoint,
-                             default_root_dir=hparams.output_dir,
-                             logger=my_loggers,
-                             gpus=hparams.gpus,
-                             max_epochs=hparams.epochs,
-                             accelerator=hparams.distributed_backend,
-                             precision=16 if hparams.use_16bit else 32,
-                             fast_dev_run=hparams.fast_dev_run,
-                             callbacks=[checkpoint_callback],
-                             num_sanity_val_steps=16 if hparams.batch_size > 63 else 100,
-                             val_check_interval=1.0 if hparams.epochs > 4 else 0.1,
-                             accumulate_grad_batches=hparams.accumulate_grad_batches,
-                             limit_train_batches=50 if hparams.test_run else 1.0
-                             )
+        strategy = 'auto'
+
+    if 'devices' in param_names:
+        # PyTorch Lightning 2.0+ (newest API)
+        trainer = pl.Trainer(
+            default_root_dir=hparams.output_dir,
+            logger=my_loggers,
+            devices=hparams.gpus if hparams.gpus > 0 else 'auto',
+            max_epochs=hparams.epochs,
+            accelerator='cpu' if hparams.gpus == 0 else 'gpu',
+            strategy=strategy,
+            precision='16-mixed' if hparams.use_16bit else 32,
+            fast_dev_run=hparams.fast_dev_run,
+            callbacks=[checkpoint_callback],
+            num_sanity_val_steps=16 if hparams.batch_size > 63 else 100,
+            val_check_interval=1.0 if hparams.epochs > 4 else 0.1,
+            accumulate_grad_batches=hparams.accumulate_grad_batches,
+            limit_train_batches=50 if hparams.test_run else 1.0,
+            gradient_clip_val=1.0,  # Clip gradients to prevent NaN/exploding gradients
+            gradient_clip_algorithm='norm'
+        )
+    elif 'strategy' in param_names:
+        # PyTorch Lightning 1.5-1.9
+        trainer = pl.Trainer(
+            default_root_dir=hparams.output_dir,
+            logger=my_loggers,
+            gpus=hparams.gpus,
+            max_epochs=hparams.epochs,
+            accelerator='cpu' if hparams.gpus == 0 else 'gpu',
+            strategy=strategy,
+            precision=16 if hparams.use_16bit else 32,
+            fast_dev_run=hparams.fast_dev_run,
+            callbacks=[checkpoint_callback],
+            num_sanity_val_steps=16 if hparams.batch_size > 63 else 100,
+            val_check_interval=1.0 if hparams.epochs > 4 else 0.1,
+            accumulate_grad_batches=hparams.accumulate_grad_batches,
+            limit_train_batches=50 if hparams.test_run else 1.0,
+            gradient_clip_val=1.0,  # Clip gradients to prevent NaN/exploding gradients
+            gradient_clip_algorithm='norm'
+        )
+    else:
+        # PyTorch Lightning before 1.4.4
+        trainer = pl.Trainer(
+            resume_from_checkpoint=resume_from_checkpoint,
+            default_root_dir=hparams.output_dir,
+            logger=my_loggers,
+            gpus=hparams.gpus,
+            max_epochs=hparams.epochs,
+            accelerator=hparams.distributed_backend,
+            precision=16 if hparams.use_16bit else 32,
+            fast_dev_run=hparams.fast_dev_run,
+            callbacks=[checkpoint_callback],
+            num_sanity_val_steps=16 if hparams.batch_size > 63 else 100,
+            val_check_interval=1.0 if hparams.epochs > 4 else 0.1,
+            accumulate_grad_batches=hparams.accumulate_grad_batches,
+            limit_train_batches=50 if hparams.test_run else 1.0,
+            gradient_clip_val=1.0  # Clip gradients to prevent NaN/exploding gradients
+        )
 
     if not hparams.evaluate:
         # train / val
         print('start training')
-        trainer.fit(trainer_mod, data_mod)
+        # For PL 2.0+, pass ckpt_path to fit() instead of Trainer()
+        trainer.fit(trainer_mod, data_mod, ckpt_path=resume_from_checkpoint)
         print('start evaluating')
         print('evaluating from ', checkpoint_callback.best_model_path)
         trainer.test(ckpt_path='best', datamodule=data_mod)

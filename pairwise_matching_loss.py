@@ -35,7 +35,7 @@ class PairwiseMatchingLoss(Module):
         if input.dim() != 4:
             raise ValueError('expected 4D input (got {}D input)'.format(input.dim()))
 
-    def forward(self, feature, target):
+    def forward(self, feature, target, occlusion_maps=None):
         self._check_input_dim(feature)
         
         # Ensure matcher is in training mode
@@ -54,22 +54,12 @@ class PairwiseMatchingLoss(Module):
         # Calculate matching scores
         # For TransMatcher, we need to set memory first, then call forward
         self.matcher.make_kernel(feature)
-        score = self.matcher(feature)  # [b, b]
+        score = self.matcher(feature, prob_occ=occlusion_maps, gal_occ=occlusion_maps)  # [b, b]
         
         target1 = target.unsqueeze(1)
         mask = (target1 == target1.t())
         pair_labels = mask.float()
-        
-        # Debug information
-        unique_labels = torch.unique(target)
-        num_positive_pairs = (pair_labels == 1).sum().item()
-        num_negative_pairs = (pair_labels == 0).sum().item()
-        
-        print(f"[PAIRWISE_LOSS DEBUG] Unique labels in batch: {unique_labels.cpu().numpy()}")
-        print(f"[PAIRWISE_LOSS DEBUG] Pairwise mask sum: {num_positive_pairs} / {pair_labels.numel()}")
-        print(f"[PAIRWISE_LOSS DEBUG] Pairwise mask (first 10x10):")
-        print(pair_labels[:10, :10].cpu().numpy())
-        
+
         loss = F.binary_cross_entropy_with_logits(score, pair_labels, reduction='none')
         loss = loss.sum(-1)
 
