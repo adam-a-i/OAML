@@ -1,48 +1,26 @@
 # OAML: Occlusion-Aware Metric Learning for Face Recognition
 
-OAML is a novel face recognition framework that combines metric learning with occlusion-aware training to achieve robust performance under challenging conditions. Our solution is particularly effective for handling partial face occlusions, such as medical masks, while maintaining high accuracy on standard face recognition benchmarks.
+OAML is a face recognition framework that combines global and local feature matching with occlusion-aware training to achieve robust performance under challenging conditions, particularly for partially occluded faces.
 
-## Key Features
+## Architecture
 
-- **Occlusion-Aware Training**: 
-  - Medical mask occlusion simulation with realistic positioning
-  - Configurable occlusion probability and mask parameters
-  - Standard reference points for consistent alignment
+![OAML Architecture](image%20(6).png)
 
-- **Advanced Metric Learning**:
-  - Dual-branch architecture combining global and local features
-  - Pairwise matching loss for direct feature comparison
-  - Triplet loss for improved feature discrimination
-  - PK sampling strategy for effective batch construction
+The model uses a multi-task learning framework with a shared IR-50 backbone and three branches:
 
-- **Robust Evaluation**:
-  - Support for multiple face recognition benchmarks
-  - Comprehensive metrics for occlusion scenarios
-  - Combined scoring system for optimal performance
+1. **AdaFace Branch**: Global feature-based recognition using adaptive margin softmax loss
+2. **QAConv Branch**: Local feature matching with occlusion-aware spatial correlation
+3. **Occlusion Prediction Branch**: Lightweight CNN head for spatial occlusion prediction
+
+The total loss combines all three branches:
+```
+L_total = λ_ada × L_AdaFace + λ_qa × L_QAConv + λ_occ × L_Occlusion
+```
 
 ## Installation
 
 ```bash
 pip install -r requirements.txt
-```
-
-## Project Structure
-
-```
-OAML/
-├── dataset/              # Dataset handling code
-├── face_alignment/       # Face alignment utilities
-├── assets/              # Model weights and resources
-├── scripts/             # Utility scripts
-├── validation_*/        # Validation datasets
-├── data.py             # Data loading and preprocessing
-├── net.py              # Network architecture
-├── qaconv.py           # Local feature matching
-├── transforms.py        # Data augmentation transforms
-├── train_val.py        # Training and validation logic
-├── main.py             # Training entry point
-├── main_eval.py        # Evaluation entry point
-└── requirements.txt     # Project dependencies
 ```
 
 ## Usage
@@ -61,50 +39,45 @@ python main_eval.py --model-path /path/to/model --data-path /path/to/test/data
 
 ## Key Components
 
-### Medical Mask Occlusion
-The `MedicalMaskOcclusion` transform simulates face occlusions using medical masks:
-- Random mask positioning and scaling for realistic simulation
-- Configurable occlusion probability (default: 0.5)
-- Standard reference points for CASIA WebFace alignment
-- Adjustable mask dimensions for different occlusion patterns
+### Backbone
+- IR-50 (ResNet-50 variant) extracts 7×7×512 feature maps
+- Shared features feed all three branches
 
-### Metric Learning Architecture
-Our dual-branch architecture combines:
-- Global feature branch for overall face representation
-- Local feature branch for handling occlusions
-- Feature fusion for robust recognition
+### AdaFace Branch
+- Global pooling (GNAP/GDC) aggregates spatial features
+- Produces 512-dimensional embeddings
+- Uses adaptive margin softmax loss based on image quality
 
-### Loss Functions
-- Pairwise Matching Loss: Direct comparison of feature pairs
-- Triplet Loss: Enforces margin between positive and negative pairs
-- Combined loss function with configurable weights
+### QAConv Branch
+- Local feature matching via spatial correlation
+- Occlusion maps weight correlation scores
+- Graph sampling (k-nearest neighbors) for efficient training
+- Combines classification loss and triplet loss
 
-### PK Sampling
-- Identity-aware batch sampling strategy
-- Ensures K instances per identity in each batch
-- Optimized for metric learning objectives
-- Configurable batch size and instances per identity
+### Occlusion Prediction
+- Lightweight CNN head (OcclusionHead) predicts 7×7 occlusion maps
+- Values: 1 = visible, 0 = occluded
+- Trained with MSE loss against ground truth masks
 
-## Citation
+## Project Structure
 
-If you use this code in your research, please cite:
-
-```bibtex
-@article{oaml2024,
-  title={OAML: Occlusion-Aware Metric Learning for Face Recognition},
-  author={Adam Ibrahim, Shengcia Liao},
-  journal={[Journal/Conference]},
-  year={2024}
-}
+```
+OAML/
+├── dataset/              # Dataset handling code
+├── face_alignment/       # Face alignment utilities
+├── assets/              # Model weights and resources
+├── scripts/             # Utility scripts
+├── validation_*/        # Validation datasets
+├── data.py             # Data loading and preprocessing
+├── net.py              # Network architecture
+├── qaconv.py           # QAConv local feature matching
+├── transforms.py        # Data augmentation transforms
+├── train_val.py        # Training and validation logic
+├── main.py             # Training entry point
+├── main_eval.py        # Evaluation entry point
+└── requirements.txt     # Project dependencies
 ```
 
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- Based on AdaFace: [https://github.com/mk-minchul/AdaFace](https://github.com/mk-minchul/AdaFace)
-- QAConv implementation inspired by: [https://github.com/scliao/QAConv](https://github.com/scliao/QAConv)
-
-
