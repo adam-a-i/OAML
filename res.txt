@@ -135,6 +135,18 @@ QACONV EVALUATION RESULTS
 
 w/occ 
 
+Verification Results:
+------------------------------------------------------------
+Method          VR@FAR=0.001    VR@FAR=0.0001
+------------------------------------------------------------
+ - Genuine pairs: 7200, Imposter pairs: 1432800
+AdaFace         41.44%      19.75%
+ - Genuine pairs: 7200, Imposter pairs: 1432800
+QAConv          43.74%      19.61%
+ - Genuine pairs: 7200, Imposter pairs: 1432800
+Combined        42.86%      19.50%
+
+Detailed results saved to: ./evaluation_results/verification_results.txt
 
 
 

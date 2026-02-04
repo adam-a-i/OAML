@@ -11,6 +11,7 @@ import sys
 from PIL import Image
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
 from torchvision import transforms
 import glob
 
@@ -62,7 +63,7 @@ def get_occlusion_prediction(model, image_tensor, device):
 
 
 def visualize_comparison(model, vpi_paths, clean_paths, device, output_dir):
-    """Visualize occlusion maps for VPI and clean images side by side."""
+    """Visualize occlusion maps for VPI and clean images in a paper-friendly layout."""
     os.makedirs(output_dir, exist_ok=True)
     
     tensor_transform = transforms.Compose([
@@ -75,8 +76,8 @@ def visualize_comparison(model, vpi_paths, clean_paths, device, output_dir):
         transforms.Resize((112, 112)),
     ])
     
-    fig = plt.figure(figsize=(20, 12))
-    gs = gridspec.GridSpec(3, 6, figure=fig, hspace=0.3, wspace=0.3)
+    # Collect samples (we'll render as columns: Original (top) -> Map (bottom))
+    fig = plt.figure(figsize=(3.2 * 6, 6.2))  # tuned for up to ~6 samples
     
     all_images = []
     all_maps = []
@@ -92,7 +93,7 @@ def visualize_comparison(model, vpi_paths, clean_paths, device, output_dir):
             
             all_images.append(np.array(raw_image_resized))
             all_maps.append(predicted_map)
-            all_labels.append(f"VPI {i+1}\n{os.path.basename(img_path)[:20]}")
+            all_labels.append("")  # no dataset/index labels for paper figure
         except Exception as e:
             print(f"Error processing {img_path}: {e}")
     
@@ -106,46 +107,85 @@ def visualize_comparison(model, vpi_paths, clean_paths, device, output_dir):
             
             all_images.append(np.array(raw_image_resized))
             all_maps.append(predicted_map)
-            all_labels.append(f"Clean {i+1}\n{os.path.basename(img_path)[:20]}")
+            all_labels.append("")  # no dataset/index labels for paper figure
         except Exception as e:
             print(f"Error processing {img_path}: {e}")
-    
-    # Plot: 3 rows (VPI, Clean, Clean), 6 cols (Original, Overlay, Map for each)
+
+    # Render samples: N rows x 2 columns (Original -> Map), with clear horizontal arrows
+    n = len(all_images)
+    if n == 0:
+        print("No images to visualize.")
+        return
+
+    # More spacing for paper readability
+    gs = gridspec.GridSpec(n, 2, figure=fig, hspace=0.55, wspace=0.35)
+
+    # No title/subtitle at top (paper figure will add caption externally)
+
+    # Shared colorbar axis on the right (tight to plots)
+    # Note: values are figure-relative: [left, bottom, width, height]
+    cbar_ax = fig.add_axes([0.875, 0.18, 0.012, 0.62])
+    last_im = None
+
     for idx, (img, occ_map, label) in enumerate(zip(all_images, all_maps, all_labels)):
-        row = idx // 2
-        col_base = (idx % 2) * 3
-        
-        # Original image
-        ax1 = fig.add_subplot(gs[row, col_base])
-        ax1.imshow(img)
-        ax1.set_title(f"{label}\nOriginal", fontsize=10)
-        ax1.axis('off')
-        
-        # Overlay
-        ax2 = fig.add_subplot(gs[row, col_base + 1])
-        ax2.imshow(img)
+        # Resize occlusion map to match image size (same as analyze_occlusion_maps.py)
         h, w = img.shape[:2]
-        occ_resized = np.array(Image.fromarray((occ_map * 255).astype(np.uint8)).resize((w, h), Image.BILINEAR)) / 255.0
-        occlusion_overlay = 1 - occ_resized
-        ax2.imshow(occlusion_overlay, cmap='Reds', alpha=0.6, vmin=0, vmax=1)
-        ax2.set_title(f"Overlay\n(Red=Occluded)", fontsize=10)
-        ax2.axis('off')
-        
-        # Standalone map
-        ax3 = fig.add_subplot(gs[row, col_base + 2])
-        im3 = ax3.imshow(occ_resized, cmap='RdYlGn', vmin=0, vmax=1)
-        ax3.set_title(f"Map\n(Green=Visible)", fontsize=10)
-        ax3.axis('off')
-        plt.colorbar(im3, ax=ax3, fraction=0.046)
-        
-        # Add stats
-        mean_vis = occ_map.mean()
-        ax3.text(0.5, -0.15, f"μ={mean_vis:.3f}",
-                 transform=ax3.transAxes, fontsize=9, ha='center',
-                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-    
-    plt.suptitle('Occlusion Head Predictions: VPI (Niqab) vs Clean Faces', fontsize=14, fontweight='bold')
-    plt.savefig(os.path.join(output_dir, 'occlusion_comparison.png'), dpi=150, bbox_inches='tight', facecolor='white')
+        occ_resized = np.array(
+            Image.fromarray((occ_map * 255).astype(np.uint8)).resize((w, h), Image.BILINEAR)
+        ) / 255.0
+
+        ax_left = fig.add_subplot(gs[idx, 0])
+        ax_right = fig.add_subplot(gs[idx, 1])
+
+        ax_left.imshow(img)
+        if label:
+            ax_left.set_title(label, fontsize=11)
+        ax_left.axis('off')
+
+        last_im = ax_right.imshow(occ_resized, cmap='RdYlGn', vmin=0, vmax=1)
+        ax_right.axis('off')
+
+        # Mean visibility annotation (small, below map)
+        mean_vis = float(occ_map.mean())
+        ax_right.text(
+            0.5,
+            -0.10,
+            f"μ={mean_vis:.3f}",
+            transform=ax_right.transAxes,
+            fontsize=9,
+            ha='center',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, linewidth=0.5),
+        )
+
+        # Arrow from original -> map (figure coordinates for a clean horizontal arrow)
+        left_bb = ax_left.get_position()
+        right_bb = ax_right.get_position()
+        y_mid = (left_bb.y0 + left_bb.y1) / 2.0
+        # Even shorter arrow: draw only a small segment centered in the gap (gap-relative),
+        # so it stays short regardless of figure size/spacing.
+        gap = right_bb.x0 - left_bb.x1
+        x_start = left_bb.x1 + gap * 0.48
+        x_end = right_bb.x0 - gap * 0.48
+        if x_end <= x_start:
+            # Fallback if layout is extremely tight
+            x_start = left_bb.x1 + gap * 0.40
+            x_end = right_bb.x0 - gap * 0.40
+        ax_left.annotate(
+            "",
+            xy=(x_end, y_mid),
+            xytext=(x_start, y_mid),
+            xycoords=fig.transFigure,
+            textcoords=fig.transFigure,
+            arrowprops=dict(arrowstyle="-|>", lw=3.0, color="#111111", mutation_scale=18),
+        )
+
+    if last_im is not None:
+        cbar = plt.colorbar(last_im, cax=cbar_ax)
+        cbar.set_ticks([0, 0.5, 1.0])
+        cbar.set_ticklabels(["Occ", "0.5", "Vis"])
+
+    out_path = os.path.join(output_dir, 'occlusion_comparison.png')
+    plt.savefig(out_path, dpi=200, bbox_inches='tight', facecolor='white')
     plt.close()
     
     # Print summary
@@ -163,7 +203,7 @@ def visualize_comparison(model, vpi_paths, clean_paths, device, output_dir):
         print(f"  Image {i+1}: mean visibility = {mean:.4f}")
     print(f"  Average: {np.mean(clean_means):.4f}")
     print("="*60)
-    print(f"\nSaved comparison to: {os.path.join(output_dir, 'occlusion_comparison.png')}")
+    print(f"\nSaved comparison to: {out_path}")
 
 
 def find_images(path, num=3):
@@ -185,6 +225,12 @@ def main():
     parser = argparse.ArgumentParser(description='Compare occlusion maps on VPI and clean images')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to model checkpoint')
+    parser.add_argument(
+        '--image_dir',
+        type=str,
+        default=None,
+        help='If set, ignore --vpi_path/--clean_path and visualize images from this single directory.',
+    )
     parser.add_argument('--vpi_path', type=str, default='/home/maass/code/VPI dataset resized 25%',
                         help='Path to VPI dataset')
     parser.add_argument('--clean_path', type=str, default='/home/maass/code/faces_webface_112x112',
@@ -204,11 +250,24 @@ def main():
         return
     
     print(f"\nFinding images...")
+    if args.image_dir is not None:
+        # Single-directory mode (use same visualization layout, but label as "Custom")
+        paths = find_images(args.image_dir, args.num_per_type * 2)
+        if len(paths) < max(1, args.num_per_type):
+            print("ERROR: Could not find enough images in --image_dir")
+            return
+        # Split into two groups just to reuse the existing grid layout
+        vpi_paths = paths[: args.num_per_type]
+        clean_paths = paths[args.num_per_type : args.num_per_type * 2]
+        print(f"Found {len(paths)} images in {args.image_dir}")
+        visualize_comparison(model, vpi_paths, clean_paths, device, args.output_dir)
+        return
+
     vpi_paths = find_images(args.vpi_path, args.num_per_type)
     clean_paths = find_images(args.clean_path, args.num_per_type)
-    
+
     print(f"Found {len(vpi_paths)} VPI images, {len(clean_paths)} clean images")
-    
+
     if vpi_paths and clean_paths:
         visualize_comparison(model, vpi_paths, clean_paths, device, args.output_dir)
     else:

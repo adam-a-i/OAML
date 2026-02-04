@@ -133,7 +133,7 @@ class Trainer(LightningModule):
         self.niqab_dataset = NiqabMaskDataset(
             root_dir=niqab_path,
             image_transform=get_default_niqab_transform(image_size=112),
-            mask_target_size=7,  # Match feature map resolution
+            mask_target_size=14,  # Match intermediate feature map resolution (14x14 from Block 3)
             image_subdir='kept_faces',
             mask_subdir='masks',
             mask_suffix='_mask'
@@ -275,10 +275,10 @@ class Trainer(LightningModule):
             clean_images = clean_batch[0]
             
             # Create all-ones masks for clean faces (fully visible)
-            # Shape: [B, 1, 7, 7] matching niqab mask shape
+            # Shape: [B, 1, 14, 14] matching intermediate feature map resolution
             # Use same device and dtype as niqab_masks to ensure compatibility
             clean_batch_size = clean_images.shape[0]
-            clean_masks = torch.ones(clean_batch_size, 1, 7, 7, 
+            clean_masks = torch.ones(clean_batch_size, 1, 14, 14,
                                     device=niqab_images.device,  # Match niqab device
                                     dtype=niqab_masks.dtype)      # Match niqab dtype
             
@@ -365,7 +365,7 @@ class Trainer(LightningModule):
             print(f"WARNING: Training images contain NaN values. Replacing with zeros.")
             images = torch.nan_to_num(images, nan=0.0)
 
-        # get features from model up to before output layer
+        # get intermediate features (14x14, 256ch) from body_early for QAConv and OcclusionHead
         x = self.model.input_layer(images)
 
         # Check for NaNs
@@ -373,31 +373,43 @@ class Trainer(LightningModule):
             print(f"WARNING: Values after input layer contain NaNs. Replacing with zeros.")
             x = torch.nan_to_num(x, nan=0.0)
 
-        for i, layer in enumerate(self.model.body):
+        # Process through body_early (Blocks 1-3) to get 14x14 intermediate features
+        for i, layer in enumerate(self.model.body_early):
             x = layer(x)
             # Check for NaNs periodically (every 10 layers to avoid performance impact)
             if i % 10 == 0 and torch.isnan(x).any():
-                print(f"WARNING: Values after body layer {i} contain NaNs. Replacing with zeros.")
+                print(f"WARNING: Values after body_early layer {i} contain NaNs. Replacing with zeros.")
                 x = torch.nan_to_num(x, nan=0.0)
 
-        # Final check for NaNs before normalization
-        if torch.isnan(x).any():
-            print(f"WARNING: Feature maps contain NaNs before normalization. Replacing with zeros.")
-            x = torch.nan_to_num(x, nan=0.0)
-            # Add small epsilon to non-zero values to prevent division issues
-            x = x + 1e-8 * (x.abs() > 0).float()
+        # Store intermediate features (14x14, 256ch) for QAConv and OcclusionHead
+        intermediate_x = x
 
-        # normalize feature maps for qaconv
-        x_norm = torch.norm(x.view(x.size(0), -1), p=2, dim=1, keepdim=True).view(x.size(0), 1, 1, 1)
+        # Final check for NaNs before normalization
+        if torch.isnan(intermediate_x).any():
+            print(f"WARNING: Intermediate feature maps contain NaNs before normalization. Replacing with zeros.")
+            intermediate_x = torch.nan_to_num(intermediate_x, nan=0.0)
+            # Add small epsilon to non-zero values to prevent division issues
+            intermediate_x = intermediate_x + 1e-8 * (intermediate_x.abs() > 0).float()
+
+        # normalize intermediate feature maps for qaconv (14x14 resolution)
+        x_norm = torch.norm(intermediate_x.view(intermediate_x.size(0), -1), p=2, dim=1, keepdim=True).view(intermediate_x.size(0), 1, 1, 1)
         # Prevent division by zero
         x_norm = torch.clamp(x_norm, min=1e-8)
-        feature_maps = x / x_norm
+        feature_maps = intermediate_x / x_norm
 
         # Compute occlusion maps for the main batch (detached from backbone)
-        # Occlusion maps will be used to weight QAConv matching
-        occlusion_maps = self.model.occlusion_head(x.detach())
+        # Occlusion maps will be used to weight QAConv matching (14x14 resolution)
+        occlusion_maps = self.model.occlusion_head(intermediate_x.detach())
         # IMPORTANT: prevent QAConv gradients from flowing into OcclusionHead
         occlusion_maps_for_qaconv = occlusion_maps.detach()
+
+        # Continue through body_late (Block 4) to get final features for embedding
+        final_x = intermediate_x
+        for i, layer in enumerate(self.model.body_late):
+            final_x = layer(final_x)
+            if torch.isnan(final_x).any():
+                print(f"WARNING: Values after body_late layer {i} contain NaNs. Replacing with zeros.")
+                final_x = torch.nan_to_num(final_x, nan=0.0)
 
         # Make deep copy of feature maps to avoid inference tensor issues
         feature_maps = feature_maps.clone().detach().requires_grad_(True)
@@ -409,8 +421,8 @@ class Trainer(LightningModule):
             # Force normalization again with safety measures
             feature_maps = F.normalize(feature_maps, p=2, dim=1).clone().detach().requires_grad_(True)
 
-        # get adaface embeddings through output layer
-        embeddings = self.model.output_layer(x)
+        # get adaface embeddings through output layer (from final 7x7 features)
+        embeddings = self.model.output_layer(final_x)
 
         # Check for NaNs in embeddings
         if torch.isnan(embeddings).any():
@@ -441,22 +453,22 @@ class Trainer(LightningModule):
                 occlusion_images = occlusion_images.to(device)
                 occlusion_masks = occlusion_masks.to(device)
 
-                # Forward mixed images through backbone to get feature maps
+                # Forward mixed images through body_early to get 14x14 intermediate feature maps
                 # DETACHED: Occlusion loss should only train OcclusionHead, not backbone
                 # This is consistent with QAConv (which is also detached from backbone)
                 with torch.no_grad():
                     occlusion_x = self.model.input_layer(occlusion_images)
-                    for layer in self.model.body:
+                    for layer in self.model.body_early:
                         occlusion_x = layer(occlusion_x)
-                
+
                 # Detach and enable gradients for OcclusionHead training only
                 occlusion_x = occlusion_x.detach().requires_grad_(True)
 
-                # Compute occlusion maps from mixed feature maps
+                # Compute occlusion maps from intermediate feature maps (14x14 resolution)
                 # Gradients will flow to OcclusionHead only (not backbone)
-                occlusion_pred_maps = self.model.occlusion_head(occlusion_x)  # [B, 1, 7, 7]
+                occlusion_pred_maps = self.model.occlusion_head(occlusion_x)  # [B, 1, 14, 14]
 
-                # Resize GT masks if needed (should already be 7x7, but just in case)
+                # Resize GT masks if needed (should already be 14x14, but just in case)
                 if occlusion_masks.shape[-2:] != occlusion_pred_maps.shape[-2:]:
                     occlusion_masks = F.interpolate(
                         occlusion_masks,
@@ -584,21 +596,20 @@ class Trainer(LightningModule):
             print(f"WARNING: Input images contain NaN values. Replacing with zeros.")
             images = torch.nan_to_num(images, nan=0.0)
         
-        # get features from model up to before output layer
+        # get intermediate features (14x14, 256ch) from body_early for QAConv and OcclusionHead
         with torch.no_grad():  # Ensure we don't track gradients
-            # Extract feature maps directly from the model's input layer and body
-            # This is more reliable than trying to get intermediate outputs
+            # Extract intermediate feature maps from body_early (Blocks 1-3)
             x = self.model.input_layer(images)
-            
-            # Process through body layers
-            for layer in self.model.body:
+
+            # Process through body_early layers to get 14x14 intermediate features
+            for layer in self.model.body_early:
                 x = layer(x)
-            
-            # At this point, x contains the feature maps needed for QAConv
+
+            # At this point, x contains the 14x14 intermediate feature maps for QAConv
             # Normalize these feature maps
             feature_maps = F.normalize(x, p=2, dim=1)
 
-            # Compute occlusion maps for QAConv weighting
+            # Compute occlusion maps for QAConv weighting (14x14 resolution)
             occlusion_maps = self.model.occlusion_head(x)
             
             # get adaface embeddings with flip augmentation

@@ -1,0 +1,70 @@
+**How Graph Sampling (GS) and k (k_nearest) Are Used in Training:**
+
+**1. Initialization Step (train_val.py, lines 75-81):**
+- `k_nearest` is passed as a hyperparameter (e.g., `--k_nearest 256` from command line)
+- QAConv is initialized with `k_nearest=self.hparams.k_nearest`
+- This sets `self.k_nearest` in the QAConv module, determining how many neighbor classes to consider
+
+**2. Lazy Computation of Class Neighbors (qaconv.py, lines 307-311):**
+- `compute_class_neighbors()` is called **lazily** (on-demand) during the first forward pass
+- Triggered when: `self.training=True`, `gal_fea=None`, and `self.class_neighbors is None`
+- This happens automatically in `qaconv.forward()` - no explicit call needed in training_step
+
+**3. What compute_class_neighbors() Does:**
+- Computes pairwise cosine similarity between all class embeddings
+- For each class, finds the k-nearest neighbor classes (excluding itself)
+- Stores result in `self.class_neighbors` with shape `[num_classes, k_nearest]`
+- Uses `topk(k=self.k_nearest + 1, dim=1)` to get k nearest (line 129), then excludes self (line 130)
+
+**4. During Training Step (train_val.py, training_step → qaconv.forward):**
+- When `training_step()` calls QAConv loss functions (PairwiseMatchingLoss or SoftmaxTripletLoss)
+- These loss functions call `qaconv.forward()` with `gal_fea=None` (training mode)
+- QAConv's `forward()` detects training mode and uses class embeddings instead of gallery features
+- **First time**: `compute_class_neighbors()` is called automatically (line 310-311)
+- **Subsequent times**: Uses cached `self.class_neighbors` (no recomputation)
+
+**5. How k_nearest Is Used During Forward Pass (qaconv.py, lines 343-415):**
+- For each sample in the batch, looks up its class label
+- Retrieves the k-nearest neighbors for that class: `neighbors = self.class_neighbors[class_label]`
+- Only computes similarity scores against those k neighbors (not all classes)
+- Returns sparse score matrix: `all_scores[batch_size, num_classes]` where only k entries per row are non-zero
+
+**6. Key Training Flow:**
+
+```
+training_step() 
+  → PairwiseMatchingLoss.forward() or SoftmaxTripletLoss.forward()
+    → qaconv.forward(prob_fea, gal_fea=None, labels=labels)
+      → [FIRST TIME] compute_class_neighbors()  # Uses k_nearest parameter
+      → Lookup neighbors: class_neighbors[label]  # Returns k class indices
+      → Compute similarity only against k neighbors (not all classes)
+      → Return sparse scores [batch_size, num_classes] with only k non-zero entries per row
+```
+
+**7. When Neighbors Are Recomputed:**
+- **Start of each epoch**: `on_epoch_start()` resets `self.class_neighbors = None` (if implemented)
+- **First forward pass**: Automatically recomputes if `class_neighbors is None`
+- **During epoch**: Cached neighbors are reused (no recomputation per batch)
+
+**8. Memory/Computation Benefit:**
+- **Without GS**: Compute similarity against all `num_classes` (e.g., 10,000+ classes)
+- **With GS (k=256)**: Compute similarity against only 256 neighbors per sample
+- **Reduction**: ~40x fewer similarity computations (10,000 → 256)
+
+**9. Example with k_nearest=256:**
+- Batch of 32 samples with labels [0, 5, 10, ...]
+- For sample with label 0: Lookup `class_neighbors[0]` → returns [123, 456, 789, ..., 999] (256 neighbors)
+- Compute similarity: `probe_features[0]` vs `class_embed[123, 456, 789, ..., 999]` (only 256 comparisons)
+- Instead of: `probe_features[0]` vs all 10,000 class embeddings
+
+**10. Key Code Locations:**
+- **Initialization**: `train_val.py` line 81: `k_nearest=self.hparams.k_nearest`
+- **Computation**: `qaconv.py` lines 102-130: `compute_class_neighbors()`
+- **Usage**: `qaconv.py` lines 310-311: Lazy computation, lines 343-415: Using neighbors
+- **Training**: `train_val.py` line 341: `training_step()` → calls loss functions → triggers qaconv.forward()
+
+**Summary:**
+- `k_nearest` is set once during initialization
+- `compute_class_neighbors()` runs lazily on first forward pass (or start of epoch)
+- During training, each sample only matches against its k-nearest neighbor classes
+- This reduces computation from O(num_classes) to O(k_nearest) per sample

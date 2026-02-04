@@ -1,0 +1,126 @@
+# Architecture Diagram Prompt for Image Generation
+
+
+
+Create a simple, holistic neural network architecture diagram in the style of research papers (similar to the AdaFace and Multimodal Facial Prompt Generator papers). The diagram should show the main idea with clear, high-level flow and include visual elements like input/output images for me to put in my NEURIPS paper.
+
+**Layout:** Horizontal flow from left to right, with a backbone that splits into three branches. Include visual placeholders for face images and occlusion maps.
+
+**Main Flow:**
+
+**Left - Input Images:**
+- Show multiple face images **stacked together** (like a video frame stack or batch)
+- Use a single rectangular box labeled **"Input Images"** or **"Image Batch"**
+- Show 2-3 small face images stacked/overlapping within this box to represent a batch
+- **Note for image insertion:** Leave space/placeholders where actual face images will be inserted
+- Visual: Think of it like a stack of photos - multiple images shown together in one container
+
+**Center-Left - Backbone:**
+- A trapezoidal block labeled "Backbone" (or "IR-50 Backbone")
+- Arrow from "Input Images" (stacked batch) → Backbone
+- **Note:** Backbone processes the batched images together
+
+**Center - Feature Extraction:**
+- A rectangular block labeled "Feature Maps" (or "Features")
+- Arrow from Backbone → Feature Maps
+- **Note:** Feature Maps are extracted for both query and gallery images
+- **NO dimension annotations** - remove all size numbers
+
+**Center-Right - Three Branches:**
+
+**Top Branch (AdaFace):**
+- **CRITICAL:** AdaFace processes each image INDEPENDENTLY (classification, not matching)
+- Arrow from Feature Maps → "FC" (Fully Connected layer, trapezoidal block)
+- Arrow from FC → "Prediction" (rectangular block)
+- Arrow from Prediction → "Classification Score" (rectangular block)
+- Arrow from Classification Score → "AdaFace Loss" (rectangular block)
+- **Note:** AdaFace loss is computed per-image (cross-entropy classification), NOT between pairs
+- Label this branch: "AdaFace Branch" or "Global Recognition"
+- **NO dimension annotations** - remove all size numbers
+
+**Middle Branch (QAConv):**
+- Arrow from Feature Maps → "QAConv Features" (single purple rectangular block)
+- **Note:** Features are batched together (no need to separate Query/Gallery visually)
+- Arrow from "QAConv Features" → "QAConv Matcher" (rectangular block)
+- Arrow from QAConv Matcher → "QAConv Loss" (rectangular block)
+- Label this branch: "QAConv Branch" or "Local Matching"
+- **Note:** QAConv Matcher processes pairs internally, but features are shown as a combined batch
+
+**Bottom Branch (Occlusion Segmentation - Sub-branch for QAConv):**
+- Arrow from Feature Maps → "OcclusionHead" (trapezoidal or rectangular block)
+- Arrow from OcclusionHead → "Occlusion Maps" (rectangular block, **plural**)
+- **NO dimension annotations** - remove all size numbers
+- **Visual Output:** Show **multiple occlusion map visualizations stacked together** (2-3 small heatmaps)
+- Each occlusion map should show visible regions (green/yellow) and occluded regions (red)
+- **Note for image insertion:** Leave space/placeholders where actual occlusion map visualizations will be inserted
+- Visual: Similar to input images - multiple occlusion maps shown together in one container
+- Arrow from Occlusion Maps → "Occlusion Loss" (rectangular block)
+- **CRITICAL Connection:** Arrow from Occlusion Maps → QAConv Matcher
+- **Label this arrow:** "Occlusion-Aware Matching" (this is the key connection showing how occlusion helps QAConv)
+- Label this branch: "Segmentation Sub-branch" or "Occlusion Prediction"
+
+**Right - Loss Combination:**
+- A rectangular block labeled "Total Loss"
+- Arrows from AdaFace Loss, QAConv Loss, and Occlusion Loss all converge to Total Loss
+- Optional: Show formula "L = λ_ada × L_AdaFace + λ_qa × L_QAConv + λ_occ × L_Occlusion"
+
+**Visual Elements to Include:**
+
+1. **Input Face Images:**
+   - Show multiple face images **stacked together** in a single container
+   - Use a single box labeled "Input Images" or "Image Batch"
+   - Show 2-3 small face images stacked/overlapping to represent batch processing
+   - **Instruction:** Leave space where actual face images will be inserted by the user (stacked format)
+
+2. **Occlusion Map Visualization:**
+   - Show **multiple occlusion map visualizations stacked together** (2-3 small heatmaps)
+   - Each should look like a small grid/image showing visible (green/yellow) and occluded (red) regions
+   - Stack them similar to how input images are stacked
+   - **Instruction:** Leave space/placeholders where actual occlusion map visualizations will be inserted (stacked format)
+   - **NO dimension annotations** - remove all size numbers
+
+3. **Visual Style:**
+- Simple, clean boxes (rectangles for features/predictions, trapezoids for processing layers)
+- Horizontal flow from left to right
+- Three parallel branches emerging from Feature Maps
+- The Occlusion Maps should visually connect to both Occlusion Loss AND QAConv Matcher (showing it's a sub-branch that helps QAConv)
+- The "Occlusion-Aware Matching" arrow should be clearly labeled
+- Professional research paper style
+- White background
+- Color coding optional: Blue for AdaFace, Purple for QAConv, Pink for Occlusion
+- **NO dimension annotations** - keep it clean and dimension-free
+
+**Key Points to Emphasize:**
+
+1. **Batch Processing:** Input images are shown as a stacked batch (more concise, represents actual training)
+
+2. **Combined Features:** QAConv Features shown as single block (no need to separate Query/Gallery visually)
+
+3. **Stacked Occlusion Maps:** Multiple occlusion map outputs shown together (matches batch input structure)
+
+4. **Occlusion-aware matching:** The arrow from Occlusion Maps to QAConv Matcher should be labeled "Occlusion-Aware Matching"
+
+5. **Visual outputs:** Include placeholders for stacked face images and stacked occlusion map visualizations
+
+6. **Holistic connection:** Backbone → Feature Maps → Three Branches → Total Loss
+
+7. **Segmentation sub-branch:** OcclusionHead is a sub-branch that helps QAConv via occlusion-aware matching
+
+**What to Emphasize:**
+- The holistic connection: Input Images (stacked batch) → Backbone → Feature Maps → Three Branches → Total Loss
+- **Batch representation:** Show inputs and outputs as stacked batches (more concise and accurate)
+- The segmentation sub-branch (OcclusionHead) helps the QAConv branch via "Occlusion-Aware Matching"
+- Keep it simple - express the main idea, not every detail
+- Include visual elements (stacked face images, stacked occlusion maps) for better understanding
+
+**What NOT to Include:**
+- Detailed internal operations (no "Spatial Correlation", "Max Pooling", etc. inside boxes)
+- Multiple intermediate steps within branches
+- Detailed loss components (no separate Pairwise/Triplet losses)
+- **ALL dimension annotations** - remove all size numbers (7×7×512, C×1, etc.)
+- Complex arrow merging details
+
+**Style Reference:**
+- Similar to AdaFace and Multimodal Facial Prompt Generator figures: simple blocks, clear flow, holistic view, visual elements
+- Focus on "what" not "how" - show the architecture concept, not implementation details
+- Include visual placeholders for images that will be inserted later

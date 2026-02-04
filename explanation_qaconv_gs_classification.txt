@@ -1,0 +1,36 @@
+**Does QAConv Use Graph Sampling (GS)? YES**
+
+**Evidence:**
+1. **Lines 308-417 in qaconv.py**: When `self.training=True`, `gal_fea=None`, and `self.class_embed is not None`, QAConv enters "classification mode"
+2. **Line 311**: Calls `compute_class_neighbors()` which computes k-nearest neighbor classes based on class embedding similarity
+3. **Lines 343, 361, 384**: Uses `self.class_neighbors[class_label]` to get k-nearest neighbors for each class
+4. **Line 317**: Returns `all_scores` with shape `[batch_size, num_classes]` but only k entries per row are non-zero (sparse)
+5. **Lines 368, 374, 412**: Only computes similarity against k-nearest neighbors, not all classes
+
+**How it works:**
+- For each sample in batch, looks up its class label
+- Gets k-nearest neighbor classes: `neighbors = self.class_neighbors[class_label]` (k class indices)
+- Only computes similarity scores against those k neighbors
+- Returns sparse score matrix where most entries are zero
+
+**This is simulated graph sampling** (not true graph structure, just k-NN lookup to reduce computation).
+
+---
+
+**Does QAConv Have Classification Loss? YES**
+
+**Evidence:**
+1. **SoftmaxTripletLoss (softmax_triplet_loss.py, line 44)**: Calls `self.matcher(feature, labels=target, ...)` which is QAConv
+2. **QAConv forward (qaconv.py, line 308)**: When training with labels, returns `all_scores` with shape `[batch_size, num_classes]` - these are treated as logits
+3. **SoftmaxTripletLoss (line 50)**: Uses `CrossEntropyLoss` on the logits: `cls_loss = self.cls_loss(logits, target)`
+4. **Line 91**: Combines classification loss and triplet loss: `loss = cls_loss + self.triplet_weight * triplet_loss.mean()`
+
+**How it works:**
+- QAConv returns similarity scores against class embeddings (treated as logits)
+- CrossEntropyLoss treats these scores as classification logits
+- The loss encourages high scores for the correct class and low scores for other classes
+- Combined with triplet loss for metric learning
+
+**So QAConv has BOTH:**
+- **Graph Sampling**: Uses k-nearest neighbors to reduce computation (only matches against k classes)
+- **Classification Loss**: CrossEntropyLoss on QAConv scores treated as classification logits

@@ -1,0 +1,37 @@
+I need help visualizing that a face recognition model (AdaFace) uses GLOBAL feature extraction via global pooling, to contrast it with a local matching method (QAConv).
+
+**Context:**
+- AdaFace uses a ResNet backbone that outputs 7×7×512 feature maps
+- These feature maps are then passed through global pooling (GNAP/GDC: AdaptiveAvgPool2d((1,1))) which averages ALL 7×7 spatial locations into a single 512-dim embedding
+- This is different from QAConv, which performs local-to-local matching only on visible (non-occluded) regions
+
+**The Problem:**
+I want to create a visualization that proves AdaFace uses GLOBAL pooling (all regions contribute), not selective attention. However:
+
+1. **Feature map activation visualization** shows that AdaFace focuses on specific regions (eyes, mouth, etc.) - this doesn't prove "global" pooling, it just shows which regions are most active
+2. **Occlusion sensitivity analysis** also shows which regions are most important when occluded - again, this shows selective importance, not global pooling
+
+**What I Need:**
+A visualization method that demonstrates:
+- ALL 7×7 spatial locations contribute to the final embedding (via global pooling)
+- This is fundamentally different from QAConv, which only matches visible regions
+- The "global" aspect means the entire face is processed and aggregated, regardless of which specific regions have stronger activations
+
+**Key Point:**
+The visualization should emphasize that global pooling aggregates information from ALL spatial locations equally (or weighted equally by the pooling operation), not that it focuses on specific important regions. Even if some regions have stronger activations, the global pooling operation treats all 7×7 locations as contributors to the final embedding.
+
+**Questions:**
+1. What visualization techniques can show that a CNN uses global pooling (aggregates all spatial locations) rather than selective attention?
+2. How can I visualize the global pooling operation itself (AdaptiveAvgPool2d averaging all 7×7 locations)?
+3. Are there established methods in computer vision literature for visualizing global vs local feature extraction?
+4. Should I visualize the pooling operation directly, or show that removing any region affects the embedding (proving all contribute)?
+5. What's the best way to contrast this with local matching methods (like QAConv) in a paper figure?
+
+**Technical Details:**
+- Input: 112×112 face images
+- Feature maps: 7×7×512 (before global pooling)
+- Global pooling: AdaptiveAvgPool2d((1,1)) → 512-dim embedding
+- Framework: PyTorch
+- Goal: Paper-ready figure showing global feature extraction
+
+Please suggest concrete visualization methods, code approaches, or references to papers that have addressed similar visualization needs.
