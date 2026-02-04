@@ -35,7 +35,7 @@ class PairwiseMatchingLoss(Module):
         if input.dim() != 4:
             raise ValueError('expected 4D input (got {}D input)'.format(input.dim()))
 
-    def forward(self, feature, target):
+    def forward(self, feature, target, occlusion_maps=None):
         self._check_input_dim(feature)
         
         # Ensure matcher is in training mode
@@ -54,17 +54,12 @@ class PairwiseMatchingLoss(Module):
         # Calculate matching scores
         # For QAConv, we need to set memory first, then call forward for pairwise matching
         self.matcher.make_kernel(feature)
-        # For pairwise matching, pass feature as both probe and gallery to get [b, b] scores
-        score = self.matcher(feature, gal_fea=feature)  # [b, b]
+        score = self.matcher(feature, prob_occ=occlusion_maps, gal_occ=occlusion_maps)  # [b, b]
         
         target1 = target.unsqueeze(1)
         mask = (target1 == target1.t())
         pair_labels = mask.float()
-        
-        # Debug information (verbose logging removed)
-        num_positive_pairs = (pair_labels == 1).sum().item()
-        num_negative_pairs = (pair_labels == 0).sum().item()
-        
+
         loss = F.binary_cross_entropy_with_logits(score, pair_labels, reduction='none')
         loss = loss.sum(-1)
 

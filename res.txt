@@ -1,0 +1,152 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃        Test metric        ┃       DataLoader 0        ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│   agedb_30_adaface_acc    │    0.9356666803359985     │
+│   agedb_30_combined_acc   │    0.9356666803359985     │
+│    agedb_30_qaconv_acc    │            0.0            │
+│     calfw_adaface_acc     │    0.9316666722297668     │
+│    calfw_combined_acc     │    0.9316666722297668     │
+│     calfw_qaconv_acc      │            0.0            │
+│    cfp_fp_adaface_acc     │    0.9281428456306458     │
+│    cfp_fp_combined_acc    │    0.9281428456306458     │
+│     cfp_fp_qaconv_acc     │            0.0            │
+│     cplfw_adaface_acc     │    0.8824999928474426     │
+│    cplfw_combined_acc     │    0.8824999928474426     │
+│     cplfw_qaconv_acc      │            0.0            │
+│           epoch           │           385.0           │
+│      lfw_adaface_acc      │    0.9938333630561829     │
+│     lfw_combined_acc      │    0.9938333630561829     │
+│      lfw_qaconv_acc       │            0.0            │
+│         test_acc          │    0.9343618750572205     │
+│     test_adaface_acc      │    0.9343618750572205     │
+│     test_combined_acc     │    0.9343618750572205     │
+│      test_qaconv_acc      │            0.0            │
+└───────────────────────────┴───────────────────────────┘
+
+
+============================================================
+QACONV EVALUATION RESULTS
+============================================================
+  agedb_30: 0.8450
+  cfp_fp: 0.8299
+  lfw: 0.8612
+  cplfw: 0.8312
+  calfw: 0.8627
+
+  Average QAConv accuracy: 0.8460
+============================================================
+
+
+------------------------------------------------------------
+Method          VR@FAR=0.001    VR@FAR=0.0001
+------------------------------------------------------------
+ - Genuine pairs: 7200, Imposter pairs: 1432800
+AdaFace         41.89%      19.19%
+ - Genuine pairs: 7200, Imposter pairs: 1432800
+QAConv          42.25%      19.11%
+ - Genuine pairs: 7200, Imposter pairs: 1432800
+Combined        42.76%      19.25%
+
+
+
+
+run 2
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃        Test metric        ┃       DataLoader 0        ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│   agedb_30_adaface_acc    │    0.9380000233650208     │
+│   agedb_30_combined_acc   │    0.9380000233650208     │
+│    agedb_30_qaconv_acc    │            0.0            │
+│     calfw_adaface_acc     │    0.9336666464805603     │
+│    calfw_combined_acc     │    0.9336666464805603     │
+│     calfw_qaconv_acc      │            0.0            │
+│    cfp_fp_adaface_acc     │    0.9314285516738892     │
+│    cfp_fp_combined_acc    │    0.9314285516738892     │
+│     cfp_fp_qaconv_acc     │            0.0            │
+│     cplfw_adaface_acc     │    0.8859999775886536     │
+│    cplfw_combined_acc     │    0.8859999775886536     │
+│     cplfw_qaconv_acc      │            0.0            │
+│           epoch           │           385.0           │
+│      lfw_adaface_acc      │    0.9923333525657654     │
+│     lfw_combined_acc      │    0.9923333525657654     │
+│      lfw_qaconv_acc       │            0.0            │
+│         test_acc          │    0.9362857341766357     │
+│     test_adaface_acc      │    0.9362857341766357     │
+│     test_combined_acc     │    0.9362857341766357     │
+│      test_qaconv_acc      │            0.0            │
+└───────────────────────────┴───────────────────────────┘
+
+
+============================================================
+QACONV EVALUATION RESULTS
+============================================================
+  agedb_30: 0.7995
+  cfp_fp: 0.7952
+  lfw: 0.8564
+  cplfw: 0.7659
+  calfw: 0.8548
+
+  Average QAConv accuracy: 0.8144
+============================================================
+
+
+
+run 3
+
+┃        Test metric        ┃       DataLoader 0        ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│   agedb_30_adaface_acc    │    0.9384999871253967     │
+│   agedb_30_combined_acc   │    0.9384999871253967     │
+│    agedb_30_qaconv_acc    │            0.0            │
+│     calfw_adaface_acc     │    0.9365000128746033     │
+│    calfw_combined_acc     │    0.9365000128746033     │
+│     calfw_qaconv_acc      │            0.0            │
+│    cfp_fp_adaface_acc     │    0.9314285516738892     │
+│    cfp_fp_combined_acc    │    0.9314285516738892     │
+│     cfp_fp_qaconv_acc     │            0.0            │
+│     cplfw_adaface_acc     │    0.8899999856948853     │
+│    cplfw_combined_acc     │    0.8899999856948853     │
+│     cplfw_qaconv_acc      │            0.0            │
+│           epoch           │           385.0           │
+│      lfw_adaface_acc      │    0.9931666851043701     │
+│     lfw_combined_acc      │    0.9931666851043701     │
+│      lfw_qaconv_acc       │            0.0            │
+│         test_acc          │     0.937919020652771     │
+│     test_adaface_acc      │     0.937919020652771     │
+│     test_combined_acc     │     0.937919020652771     │
+│      test_qaconv_acc      │            0.0            │
+└───────────────────────────┴───────────────────────────┘
+(adaface) maass@cvlab-5080x2-206007:~/code/OAML$ 
+
+w/o occ
+ ============================================================
+QACONV EVALUATION RESULTS
+============================================================
+  agedb_30: 0.8017
+  cfp_fp: 0.8070
+  lfw: 0.8608
+  cplfw: 0.7998
+  calfw: 0.8603
+
+  Average QAConv accuracy: 0.8259
+============================================================
+
+
+w/occ 
+
+Verification Results:
+------------------------------------------------------------
+Method          VR@FAR=0.001    VR@FAR=0.0001
+------------------------------------------------------------
+ - Genuine pairs: 7200, Imposter pairs: 1432800
+AdaFace         41.44%      19.75%
+ - Genuine pairs: 7200, Imposter pairs: 1432800
+QAConv          43.74%      19.61%
+ - Genuine pairs: 7200, Imposter pairs: 1432800
+Combined        42.86%      19.50%
+
+Detailed results saved to: ./evaluation_results/verification_results.txt
+
+
+

@@ -47,12 +47,17 @@ class EvaluationDataset(Dataset):
         
         return indices[0], indices[1], labels
 
-    def evaluate_features(self, adaface_features, qaconv_features=None, qaconv_matcher=None, weights=(0.5, 0.5)):
+    def evaluate_features(self, adaface_features, qaconv_features=None, qaconv_matcher=None, 
+                         qaconv_occ=None, weights=(0.5, 0.5)):
         """Evaluate feature vectors using multiple methods
         Args:
             adaface_features: N x D matrix of AdaFace embeddings
             qaconv_features: N x C x H x W tensor of QAConv feature maps (optional)
             qaconv_matcher: QAConv matcher module (optional)
+            qaconv_occ: N x 1 x H x W tensor of occlusion maps (optional)
+                       NOTE: For clean validation data, occlusion maps are NOT used
+                       because occlusion head was trained only on niqab data and
+                       predicts low visibility for clean faces, which hurts QAConv.
             weights: Tuple of (adaface_weight, qaconv_weight) for score combination
         Returns:
             Dictionary containing similarity matrices for each method
@@ -84,8 +89,12 @@ class EvaluationDataset(Dataset):
                         print(f"Processing batch {i//batch_size + 1}/{(N-1)//batch_size + 1} x {j//batch_size + 1}/{(N-1)//batch_size + 1}")
                         gallery_batch = qaconv_features[j:end_j]  # Gallery batch
                         
-                        # Use QAConv's forward method which can handle different batch sizes
-                        batch_sim = qaconv_matcher(query_batch, gallery_batch)
+                        # CRITICAL: Skip occlusion maps for clean validation data
+                        # Occlusion head was trained only on niqab data, so it predicts
+                        # low visibility for clean faces, which destroys QAConv scores.
+                        # Occlusion maps should only be used for occluded test sets (e.g., VPI).
+                        batch_sim = qaconv_matcher(query_batch, gallery_batch, 
+                                                  prob_occ=None, gal_occ=None)
                         qaconv_sim[i:end_i, j:end_j] = batch_sim
             
             # Analyze QAConv score distribution

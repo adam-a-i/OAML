@@ -1,0 +1,53 @@
+**How We Use 0,1 Values in Occlusion Maps:**
+
+**1. Value Convention:**
+- **1 = Visible** (not occluded) - the facial region is visible and can be used for matching
+- **0 = Occluded** - the facial region is covered/blocked and should be ignored for matching
+- Values are continuous in [0, 1] range (from sigmoid activation), allowing soft confidence
+
+**2. Where 0,1 Values Come From:**
+- **OcclusionHead output**: Sigmoid activation ensures values in [0, 1] range
+- **Ground truth masks**: Binary or continuous masks where 1.0 = visible, 0.0 = occluded
+- **Training loss**: MSE loss between predicted occlusion map and ground truth mask
+
+**3. How 0,1 Values Are Used in QAConv Matching:**
+
+The occlusion maps are used as **multiplicative weights** on spatial correlation scores:
+
+```
+weight[p, g, r, s] = prob_occ[p, r] * gal_occ[g, s]
+```
+
+Where:
+- `prob_occ[p, r]` = occlusion value at spatial location `r` for probe image `p`
+- `gal_occ[g, s]` = occlusion value at spatial location `s` for gallery image `g`
+- `r, s` index the 7×7 spatial locations (49 locations total)
+
+**4. Weighting Behavior:**
+- **Both visible (1, 1)**: weight = 1.0 × 1.0 = 1.0 → full contribution to matching
+- **One occluded (0, 1) or (1, 0)**: weight = 0.0 → zero contribution (correlation ignored)
+- **Both occluded (0, 0)**: weight = 0.0 × 0.0 = 0.0 → zero contribution
+- **Partial visibility (0.5, 0.8)**: weight = 0.5 × 0.8 = 0.4 → reduced contribution
+
+**5. Application in QAConv:**
+- Occlusion weights are applied **BEFORE max pooling** (line 253 in qaconv.py)
+- This ensures occluded regions don't contribute to the final similarity score
+- The correlation matrix `score[p, g, r, s]` is multiplied element-wise by `occlusion_weights[p, g, r, s]`
+- After weighting, max pooling selects the best matching locations (which are more likely to be visible)
+
+**6. Why This Works:**
+- **Multiplicative weighting**: If either location is occluded (0), the weight becomes 0, completely suppressing that correlation
+- **Preserves visible matches**: If both locations are visible (1), the correlation contributes fully
+- **Soft confidence**: Values between 0 and 1 allow partial confidence (e.g., 0.7 = mostly visible but uncertain)
+
+**7. Example:**
+For a niqab image where only eyes are visible:
+- Eye region: occlusion map value ≈ 1.0 (visible)
+- Mouth region: occlusion map value ≈ 0.0 (occluded by niqab)
+- When matching, eye-to-eye correlations get weight ≈ 1.0 (used)
+- Mouth-to-mouth correlations get weight ≈ 0.0 (ignored)
+- This focuses matching on visible regions only
+
+**Key Code Location:**
+- `qaconv.py` lines 238-253: Occlusion weighting applied before max pooling
+- Formula: `score = score * occlusion_weights` where weights are element-wise product of probe and gallery occlusion maps

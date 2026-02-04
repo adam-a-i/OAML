@@ -75,4 +75,13 @@ def add_task_arguments(parser):
     parser.add_argument('--accumulate_grad_batches', type=int, default=1)
     parser.add_argument('--test_run', action='store_true')
     parser.add_argument('--save_all_models', action='store_true')
+
+    # Occlusion layer parameters
+    parser.add_argument('--occlusion_loss_weight', default=0.1, type=float,
+                        help='Weight for occlusion prediction MSE loss (default: 0.1)')
+    parser.add_argument('--niqab_data_path', type=str, default='',
+                        help='Path to niqab dataset with GT masks (e.g., /home/maass/code/niqab/train)')
+    parser.add_argument('--use_occlusion_weighting', action='store_true',
+                        help='Enable occlusion-aware weighting in QAConv matching')
+
     return parser

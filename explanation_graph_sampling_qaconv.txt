@@ -1,0 +1,42 @@
+**How QAConv Simulates Graph Sampling (Not True Graph Sampling):**
+
+QAConv doesn't implement true graph sampling but rather simulates it through a k-nearest neighbor (k-NN) approximation. Here's how it works:
+
+**1. Class Embedding Initialization:**
+- Each identity class gets a learnable class embedding: `self.class_embed` with shape `[num_classes, num_features, height, width]`
+- These embeddings are initialized randomly and updated during training
+
+**2. Pre-computing "Graph" Structure (compute_class_neighbors):**
+- At the start of each epoch, `compute_class_neighbors()` is called
+- It computes pairwise cosine similarity between all class embeddings (normalized to unit vectors)
+- For each class, it finds the k-nearest neighbor classes (excluding itself) based on embedding similarity
+- This creates a "neighborhood" structure: `self.class_neighbors` with shape `[num_classes, k_nearest]`
+- **This is NOT a true graph** - it's just a similarity-based k-NN lookup table
+
+**3. Simulated Graph Sampling During Training:**
+- Instead of computing similarity against ALL classes (expensive: O(num_classes)), QAConv only computes similarity against the k-nearest neighbors
+- In `forward()`, when `self.training=True` and `gal_fea=None`, it:
+  - Looks up the k-nearest neighbors for each sample's class label
+  - Only computes similarity scores against those k neighbors
+  - Returns a sparse score matrix where most entries are zero (only k entries per row are non-zero)
+
+**4. Why It's "Simulated" Not True Graph Sampling:**
+- **No graph structure**: There's no explicit graph with nodes/edges, just a k-NN lookup
+- **Static neighborhoods**: The neighbors are computed once per epoch, not dynamically sampled
+- **No graph neural network**: No message passing or graph convolutions
+- **Just a sparse computation trick**: It's essentially a memory/computation optimization that mimics graph sampling by only considering "nearby" classes
+
+**5. The Approximation:**
+- The assumption is that similar classes (in embedding space) are more likely to be confused
+- By only matching against k-nearest neighbors, QAConv focuses on "hard negatives" (similar but different identities)
+- This is similar to graph sampling's idea of sampling neighbors, but it's deterministic (always k-nearest) rather than stochastic
+
+**Key Code Locations:**
+- `compute_class_neighbors()` (lines 102-130): Pre-computes k-NN structure
+- `forward()` training branch (lines 307-417): Uses `self.class_neighbors` to only compute against k neighbors
+- `on_epoch_start()` (lines 462-466): Resets neighbors to force recomputation each epoch
+
+**Memory/Computation Benefit:**
+- Without graph sampling: O(batch_size × num_classes) similarity computations
+- With simulated graph sampling: O(batch_size × k_nearest) similarity computations
+- For k_nearest=256 and num_classes=10,000+, this is a ~40x reduction in computation

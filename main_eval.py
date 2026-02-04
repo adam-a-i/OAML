@@ -151,7 +151,7 @@ def main():
 
     # feature extraction
     print("Extracting features...")
-    adaface_feats_list, qaconv_feats_list, labels_list = [], [], []
+    adaface_feats_list, qaconv_feats_list, qaconv_occ_list, labels_list = [], [], [], []
     with torch.no_grad():
         for imgs, labs in tqdm(loader, desc="Feature Extraction"):
             imgs = imgs.to(device)
@@ -164,6 +164,11 @@ def main():
                 # Get feature maps before final layer for QAConv
                 feature_maps = model.body(model.input_layer(imgs))
                 qaconv_feats_list.append(feature_maps.cpu())
+                
+                # Compute occlusion maps for QAConv weighting
+                if hasattr(model, 'occlusion_head') and model.occlusion_head is not None:
+                    occ_maps = model.occlusion_head(feature_maps)
+                    qaconv_occ_list.append(occ_maps.cpu())
             
             labels_list.extend(labs.numpy())
             
@@ -174,14 +179,21 @@ def main():
     if qaconv_matcher is not None:
         all_qaconv_feats = torch.cat(qaconv_feats_list, dim=0)
         print(f"Extracted QAConv features shape: {all_qaconv_feats.shape}")
+        if qaconv_occ_list:
+            all_qaconv_occ = torch.cat(qaconv_occ_list, dim=0)
+            print(f"Extracted QAConv occlusion maps shape: {all_qaconv_occ.shape}")
+        else:
+            all_qaconv_occ = None
     else:
         all_qaconv_feats = None
+        all_qaconv_occ = None
 
     # Evaluate using all methods
     print("\nComputing similarity matrices and evaluating...")
     results = dataset.evaluate_features(
         adaface_features=all_adaface_feats.to(device),
         qaconv_features=all_qaconv_feats.to(device) if qaconv_matcher is not None else None,
+        qaconv_occ=all_qaconv_occ.to(device) if all_qaconv_occ is not None else None,
         qaconv_matcher=qaconv_matcher,
         weights=(args.adaface_weight, args.qaconv_weight)
     )

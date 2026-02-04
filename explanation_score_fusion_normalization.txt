@@ -1,0 +1,40 @@
+**Clarification on Score Fusion Normalization and Dataset Usage:**
+
+**1. GS/k Usage in Training:**
+- GS (graph sampling) and k (k_nearest) are used during **training** to reduce computation
+- They determine which classes to match against (k-nearest neighbors), not how batches are sampled
+- PK sampler determines batch composition (N identities, K samples per identity)
+- GS/k determines which classes to compute similarity against during QAConv forward pass
+
+**2. PK Sampler vs GS:**
+- **PK Sampler**: Randomly samples batches with N identities × K samples per identity (determines batch composition)
+- **GS (Graph Sampling)**: Determines which classes to match against during QAConv forward (not batch sampling)
+- They are **independent**: PK sampler creates the batch, GS determines which classes to compare against
+
+**3. Score Fusion Normalization - Dataset Confusion:**
+
+**The Problem:**
+- Public benchmarks (agedb_30, cfp_fp, lfw, cplfw, calfw) are **test sets**, not validation sets
+- You cannot use test set to compute min/max for normalization (data leakage)
+
+**Correct Approach:**
+- **Option 1**: Use a separate **validation set** (held-out from training) to compute min/max values
+- **Option 2**: Use the **training set** to compute min/max values
+- Then apply those min/max values to normalize the **test set** similarity matrices
+
+**What the Code Currently Does (WRONG):**
+- `eval_combined_scores.py` computes min/max from the test set itself (lines 437-438)
+- This is incorrect because you're using test data to determine normalization parameters
+
+**What Should Be Done:**
+1. Extract AdaFace and QAConv features from **validation set** (or training set)
+2. Compute similarity matrices on validation set
+3. Compute min/max from validation similarity matrices: `min_val = sim_matrix.min()`, `max_val = sim_matrix.max()`
+4. Extract features from **test set** (public benchmarks)
+5. Compute similarity matrices on test set
+6. Normalize test similarity matrices using validation min/max: `(test_sim - min_val) / (max_val - min_val)`
+7. Combine normalized test similarity matrices
+
+**Key Point:**
+- Min/max normalization parameters must come from **validation/training data**, not test data
+- Test set should only be used for final evaluation, not for computing normalization statistics

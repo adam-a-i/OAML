@@ -1,0 +1,243 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Scribble Annotator</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 18px; }
+      .row { display: flex; gap: 18px; align-items: flex-start; }
+      .sidebar { width: 320px; }
+      .item { padding: 8px 10px; border-radius: 8px; margin-bottom: 6px; }
+      .item a { text-decoration: none; color: #111; display: block; }
+      .done { background: #e8f5e9; border: 1px solid #a5d6a7; }
+      .todo { background: #fff3e0; border: 1px solid #ffcc80; }
+      .current { outline: 3px solid #90caf9; }
+      .canvasWrap { position: relative; display: inline-block; }
+      canvas { border: 1px solid #ccc; border-radius: 10px; }
+      .toolbar { display: flex; gap: 10px; align-items: center; margin: 10px 0; }
+      .btn { padding: 8px 10px; border-radius: 10px; border: 1px solid #ccc; cursor: pointer; background: #fafafa; }
+      .btn:hover { background: #f0f0f0; }
+      .meta { color: #444; font-size: 13px; margin-top: 6px; }
+      .hint { color: #333; font-size: 13px; margin-top: 10px; line-height: 1.3; }
+      .status { margin-left: 8px; font-size: 13px; color: #0d47a1; }
+    </style>
+  </head>
+  <body>
+    <h2>Scribble Annotator (white = visible)</h2>
+    {% if not items %}
+      <p>No images found in directory.</p>
+    {% else %}
+    <div class="row">
+      <div class="sidebar">
+        <div class="hint">
+          <b>How to use:</b><br/>
+          - Paint <b>visible</b> regions in white.<br/>
+          - Erase to remove scribbles.<br/>
+          - Click <b>Save</b> to write <code>{{ masks_subdir }}/&lt;image&gt;{{ scribble_suffix }}.png</code>.<br/>
+        </div>
+        <hr/>
+        {% for it in items %}
+          <div class="item {{ 'done' if it.has_scribble else 'todo' }} {{ 'current' if it.stem == current.stem else '' }}">
+            <a href="{{ url_for('annotate', idx=loop.index0) }}">
+              <b>{{ it.filename }}</b><br/>
+              <span class="meta">{{ it.scribble_relpath or it.scribble_filename }} {{ '✓' if it.has_scribble else '' }}</span>
+            </a>
+          </div>
+        {% endfor %}
+      </div>
+
+      <div>
+        <div class="toolbar">
+          <button class="btn" id="prevBtn">Prev</button>
+          <button class="btn" id="nextBtn">Next</button>
+          <span class="status" id="status"></span>
+        </div>
+
+        <div class="toolbar">
+          <button class="btn" id="brushBtn">Brush</button>
+          <button class="btn" id="eraseBtn">Eraser</button>
+          <label>Size <input id="size" type="range" min="2" max="60" value="18"/></label>
+          <label>Opacity <input id="opacity" type="range" min="0.05" max="1" step="0.05" value="0.75"/></label>
+          <button class="btn" id="clearBtn">Clear</button>
+          <button class="btn" id="saveBtn"><b>Save</b></button>
+        </div>
+
+        <div class="canvasWrap">
+          <canvas id="c" width="{{ w }}" height="{{ h }}"></canvas>
+        </div>
+
+        <div class="meta">
+          Image: <code>{{ current.filename }}</code><br/>
+          Scribble: <code>{{ current.scribble_relpath or current.scribble_filename }}</code>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    <script>
+      const hasItems = {{ 'true' if items else 'false' }};
+      if (!hasItems) { /* nothing */ }
+      else {
+        const idx = {{ idx }};
+        const total = {{ items|length }};
+        const imageFilename = "{{ current.filename }}";
+        const scribbleRelpath = "{{ current.scribble_relpath or '' }}";
+        const scribbleFilename = "{{ current.scribble_filename or '' }}";
+        const w = {{ w }}, h = {{ h }};
+
+        const c = document.getElementById("c");
+        const ctx = c.getContext("2d");
+        ctx.imageSmoothingEnabled = true;
+
+        const statusEl = document.getElementById("status");
+        statusEl.textContent = `Item ${idx+1}/${total}`;
+
+        // background image
+        const img = new Image();
+        img.crossOrigin = "anonymous";
+        img.src = `/img/${encodeURIComponent(imageFilename)}`;
+
+        // optional existing mask
+        const mask = new Image();
+        mask.crossOrigin = "anonymous";
+        const maskPath = (scribbleRelpath && scribbleRelpath.length) ? scribbleRelpath : scribbleFilename;
+        if (maskPath && maskPath.length) {
+          mask.src = `/mask/${encodeURIComponent(maskPath)}?t=${Date.now()}`;
+        } else {
+          // no known mask path; leave blank
+          mask.src = `/mask/__missing__.png?t=${Date.now()}`;
+        }
+
+        let drawMode = "brush"; // brush|erase
+        let isDown = false;
+        let last = null;
+
+        function redrawBackground() {
+          ctx.clearRect(0,0,w,h);
+          ctx.drawImage(img, 0, 0, w, h);
+          // Draw current scribbles stored in an offscreen buffer by compositing the overlay canvas itself
+          ctx.drawImage(overlayCanvas, 0, 0, w, h);
+        }
+
+        // Separate overlay layer (transparent) to paint scribbles
+        const overlayCanvas = document.createElement("canvas");
+        overlayCanvas.width = w; overlayCanvas.height = h;
+        const octx = overlayCanvas.getContext("2d");
+        octx.clearRect(0,0,w,h);
+        octx.imageSmoothingEnabled = true;
+
+        function drawPoint(x,y) {
+          const size = Number(document.getElementById("size").value);
+          const op = Number(document.getElementById("opacity").value);
+          octx.globalCompositeOperation = (drawMode === "erase") ? "destination-out" : "source-over";
+          octx.fillStyle = `rgba(255,255,255,${op})`;
+          octx.beginPath();
+          octx.arc(x, y, size/2, 0, Math.PI*2);
+          octx.fill();
+        }
+
+        function drawLine(a,b) {
+          const size = Number(document.getElementById("size").value);
+          const op = Number(document.getElementById("opacity").value);
+          octx.globalCompositeOperation = (drawMode === "erase") ? "destination-out" : "source-over";
+          octx.strokeStyle = `rgba(255,255,255,${op})`;
+          octx.lineWidth = size;
+          octx.lineCap = "round";
+          octx.beginPath();
+          octx.moveTo(a.x, a.y);
+          octx.lineTo(b.x, b.y);
+          octx.stroke();
+        }
+
+        function getXY(ev) {
+          const r = c.getBoundingClientRect();
+          return {
+            x: Math.max(0, Math.min(w, (ev.clientX - r.left) * (w / r.width))),
+            y: Math.max(0, Math.min(h, (ev.clientY - r.top) * (h / r.height))),
+          };
+        }
+
+        c.addEventListener("pointerdown", (ev) => {
+          isDown = true;
+          c.setPointerCapture(ev.pointerId);
+          last = getXY(ev);
+          drawPoint(last.x, last.y);
+          redrawBackground();
+        });
+        c.addEventListener("pointermove", (ev) => {
+          if (!isDown) return;
+          const p = getXY(ev);
+          if (last) drawLine(last, p);
+          last = p;
+          redrawBackground();
+        });
+        c.addEventListener("pointerup", () => { isDown = false; last = null; });
+        c.addEventListener("pointercancel", () => { isDown = false; last = null; });
+
+        document.getElementById("brushBtn").onclick = () => { drawMode = "brush"; };
+        document.getElementById("eraseBtn").onclick = () => { drawMode = "erase"; };
+        document.getElementById("clearBtn").onclick = () => { octx.clearRect(0,0,w,h); redrawBackground(); };
+
+        document.getElementById("prevBtn").onclick = () => {
+          const j = Math.max(0, idx-1);
+          window.location.href = `/annotate/${j}`;
+        };
+        document.getElementById("nextBtn").onclick = () => {
+          const j = Math.min(total-1, idx+1);
+          window.location.href = `/annotate/${j}`;
+        };
+
+        document.getElementById("saveBtn").onclick = async () => {
+          // Export overlay only as PNG with alpha (white scribble strokes).
+          const dataUrl = overlayCanvas.toDataURL("image/png");
+          const res = await fetch("/save", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              image_filename: imageFilename,
+              scribble_relpath: scribbleRelpath,
+              scribble_filename: scribbleFilename,
+              mask_data_url: dataUrl,
+            }),
+          });
+          const j = await res.json();
+          if (!j.ok) {
+            alert("Save failed: " + (j.error || "unknown error"));
+            return;
+          }
+          alert("Saved: " + j.saved);
+          // reload page to update sidebar checkmarks
+          window.location.reload();
+        };
+
+        img.onload = () => {
+          // draw background then overlay
+          redrawBackground();
+          // try load existing scribble -> convert to overlay
+          mask.onload = () => {
+            // mask is grayscale 0/255; draw into overlay as alpha
+            // draw mask into temp and treat it as alpha
+            const tmp = document.createElement("canvas");
+            tmp.width=w; tmp.height=h;
+            const tctx = tmp.getContext("2d");
+            tctx.drawImage(mask,0,0,w,h);
+            const data = tctx.getImageData(0,0,w,h);
+            // write white w/ alpha where mask>0
+            const out = octx.createImageData(w,h);
+            for (let i=0;i<data.data.length;i+=4) {
+              const m = data.data[i]; // R
+              out.data[i] = 255;
+              out.data[i+1] = 255;
+              out.data[i+2] = 255;
+              out.data[i+3] = m; // alpha
+            }
+            octx.putImageData(out,0,0);
+            redrawBackground();
+          };
+          mask.onerror = () => { /* no existing scribble */ };
+        };
+      }
+    </script>
+  </body>
+</html>
+

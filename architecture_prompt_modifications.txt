@@ -1,0 +1,111 @@
+# Architecture Diagram Modifications
+
+## Instructions for Modifying the Current Diagram
+
+Based on professor feedback, make the following changes to simplify and make the diagram more concise:
+
+### 1. Input Section - Stack Multiple Images Together
+
+**Current:** Shows separate "Query Image" and "Gallery Image" boxes side by side or stacked vertically.
+
+**Change to:**
+- Show multiple input images **stacked together** (like a video frame stack or batch)
+- Use a single rectangular box labeled **"Input Images"** or **"Image Batch"**
+- Show 2-3 small face images stacked/overlapping within this box to represent a batch
+- **Remove** the separate "Query Image" and "Gallery Image" labels
+- **Keep** the placeholder for actual face images to be inserted
+
+**Visual:** Think of it like a stack of photos - multiple images shown together in one container, not separated.
+
+### 2. QAConv Features - Keep Query and Gallery Separate
+
+**Current:** Shows two separate blocks:
+- "QAConv Features (Query)"
+- "QAConv Features (Gallery)"
+
+**Change to:**
+- **KEEP** the split into Query and Gallery (this is important to show)
+- Show **two** purple rectangular blocks:
+  - **"QAConv Features (Query)"**
+  - **"QAConv Features (Gallery)"**
+- Arrow from "Feature Maps" splits into two arrows:
+  - One arrow → "QAConv Features (Query)"
+  - One arrow → "QAConv Features (Gallery)"
+- Both Query and Gallery features → "QAConv Matcher" (arrows converge)
+- **Keep** the arrow from "QAConv Matcher" → "QAConv Loss"
+
+**Rationale:** Even though inputs are shown as a batch, it's important to show that QAConv processes Query and Gallery features separately before matching them. This makes the matching concept clearer.
+
+### 3. Occlusion Maps - Stack Multiple Outputs
+
+**Current:** Shows a single "Occlusion Map (7×7×1)" block with one visualization.
+
+**Change to:**
+- Show **multiple occlusion maps stacked together** (like the input images)
+- Label: **"Occlusion Maps"** (plural, **NO dimension numbers**)
+- Show 2-3 small occlusion map visualizations stacked/overlapping within the block
+- Each occlusion map visualization should show the heatmap (visible regions in green/yellow, occluded in red)
+- **Keep** the placeholder for actual occlusion map visualizations to be inserted
+- **Keep** the arrow from "OcclusionHead" → "Occlusion Maps"
+- **Keep** the "Occlusion-Aware Matching" arrow from "Occlusion Maps" → "QAConv Matcher"
+- **Remove all dimension annotations** (7×7×1, etc.)
+
+**Visual:** Similar to input images - multiple occlusion maps shown together in one container, representing batch outputs.
+
+### 4. Remove All Dimension Annotations
+
+**Change:**
+- **Remove ALL dimension numbers** throughout the entire diagram
+- Remove: 7×7×512, 7×7×1, C×1, 112×112×3, etc.
+- Keep only component names and labels
+- The diagram should be completely dimension-free for clarity
+
+### 5. Add Classification Score Step in AdaFace Branch
+
+**Current:** FC → Prediction → AdaFace Loss
+
+**Change to:**
+- FC → Prediction → **Classification Score** → AdaFace Loss
+- Add an intermediate "Classification Score" block between "Prediction" and "AdaFace Loss"
+- This clarifies the flow: Prediction generates classification scores before computing the loss
+
+### 6. Overall Flow Remains the Same
+
+**Keep unchanged:**
+- Backbone → Feature Maps → Three Branches structure
+- AdaFace Branch (top, blue) - but with Classification Score step added
+- QAConv Branch (middle, purple) - **KEEP separate Query and Gallery features** (important for clarity)
+- Occlusion Branch (bottom, pink) - but with stacked occlusion maps
+- Total Loss combination
+- All loss weights and formulas
+
+### 7. Key Visual Changes Summary
+
+**Before:**
+- Separate Query/Gallery inputs
+- Split QAConv Features (Query/Gallery) - **KEEP THIS**
+- Single Occlusion Map
+- Dimension annotations everywhere (7×7×512, C×1, etc.)
+- FC → Prediction → AdaFace Loss (direct)
+
+**After:**
+- Stacked/batched Input Images (single container)
+- **KEEP separate QAConv Features (Query) and QAConv Features (Gallery)** - important for clarity
+- Stacked Occlusion Maps (multiple visualizations in one container)
+- **NO dimension annotations** (completely dimension-free)
+- FC → Prediction → Classification Score → AdaFace Loss
+
+### 8. Benefits of These Changes
+
+- **More concise:** Reduces visual clutter
+- **More accurate:** Represents batch processing (how it actually works in training)
+- **Cleaner:** Less redundant information (no dimension numbers)
+- **Clearer flow:** Classification Score step makes AdaFace branch more explicit
+- **Still clear:** The core architecture and flow remain understandable
+
+### 9. Implementation Notes
+
+- When creating the diagram, show the stacked images/maps as slightly overlapping or in a grid within their containers
+- Use subtle visual cues (like slight transparency or borders) to indicate multiple items in one container
+- Maintain the same color coding (Blue for AdaFace, Purple for QAConv, Pink for Occlusion)
+- Keep all arrows and connections the same, just simplify the feature representation

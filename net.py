@@ -187,6 +187,69 @@ class SEModule(Module):
         return module_input * x
 
 
+class OcclusionHead(Module):
+    """Lightweight CNN head for spatial occlusion prediction.
+
+    Predicts occlusion maps from backbone feature maps, where each spatial
+    location indicates visibility confidence (1=visible, 0=occluded).
+
+    Architecture:
+        Conv2d(in_channels -> hidden_channels, 3x3) -> BN -> ReLU -> Conv2d(hidden_channels -> 1, 1x1) -> Sigmoid
+
+    Args:
+        in_channels: Number of input feature channels (default: 512 for IR networks)
+        hidden_channels: Number of hidden channels (default: 128)
+
+    Input:
+        Feature maps of shape [B, in_channels, H, W] (e.g., [B, 512, 7, 7])
+
+    Output:
+        Occlusion maps of shape [B, 1, H, W] with values in [0, 1]
+    """
+    def __init__(self, in_channels=512, hidden_channels=128):
+        super(OcclusionHead, self).__init__()
+
+        # First conv: reduce channels and extract occlusion features
+        self.conv1 = Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = BatchNorm2d(hidden_channels)
+        self.relu = ReLU(inplace=True)
+
+        # Second conv: predict single-channel occlusion map
+        self.conv2 = Conv2d(hidden_channels, 1, kernel_size=1, bias=True)
+        self.sigmoid = Sigmoid()
+
+        # Initialize weights using Kaiming initialization
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Initialize conv layers with Kaiming normal initialization."""
+        for m in self.modules():
+            if isinstance(m, Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        """
+        Forward pass to predict occlusion map.
+
+        Args:
+            x: Feature maps [B, C, H, W] from backbone
+
+        Returns:
+            Occlusion map [B, 1, H, W] with values in [0, 1]
+            where 1 indicates visible regions and 0 indicates occluded regions
+        """
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = self.sigmoid(x)
+        return x
+
 
 class BasicBlockIR(Module):
     """ BasicBlock for IRNet
@@ -351,22 +414,25 @@ class Backbone(Module):
                                 bottleneck.stride))
         self.body = Sequential(*modules)
 
+        # Store output_channel for reference
+        self.output_channel = output_channel
+
         if input_size[0] == 112:
             self.output_layer = Sequential(BatchNorm2d(output_channel),
                                         Dropout(0.4), Flatten(),
                                         Linear(output_channel * 7 * 7, 512),
                                         BatchNorm1d(512, affine=False))
             self.qaconv = QAConv(num_features=output_channel, height=7, width=7)
-            # Occlusion head for 7x7 feature maps
-            self.occlusion_head = OcclusionHead(in_channels=output_channel, hidden_channels=256)
+            # Occlusion head for 112x112 input (7x7 feature maps)
+            self.occlusion_head = OcclusionHead(in_channels=output_channel, hidden_channels=128)
         else:
             self.output_layer = Sequential(
                 BatchNorm2d(output_channel), Dropout(0.4), Flatten(),
                 Linear(output_channel * 14 * 14, 512),
                 BatchNorm1d(512, affine=False))
             self.qaconv = QAConv(num_features=output_channel, height=14, width=14)
-            # Occlusion head for 14x14 feature maps  
-            self.occlusion_head = OcclusionHead(in_channels=output_channel, hidden_channels=256)
+            # Occlusion head for 224x224 input (14x14 feature maps)
+            self.occlusion_head = OcclusionHead(in_channels=output_channel, hidden_channels=128)
 
         initialize_weights(self.modules())
         
@@ -383,20 +449,37 @@ class Backbone(Module):
         for i, module in enumerate(self.body):
             module.register_forward_hook(lambda mod, inp, out, idx=i: hook_fn(mod, inp, out, idx))
 
-    def forward(self, x):
+    def forward(self, x, return_occlusion=False):
+        """
+        Forward pass through backbone network.
+
+        Args:
+            x: Input images [B, 3, H, W]
+            return_occlusion: If True, also return occlusion maps [B, 1, 7, 7]
+
+        Returns:
+            If return_occlusion=False (default):
+                output: L2-normalized embeddings [B, 512]
+                norm: Embedding norms [B, 1]
+            If return_occlusion=True:
+                output: L2-normalized embeddings [B, 512]
+                norm: Embedding norms [B, 1]
+                occlusion_map: Predicted occlusion maps [B, 1, H', W']
+                feature_maps: Raw feature maps [B, C, H', W'] for QAConv
+        """
         # Process through input layer
         x = self.input_layer(x)
-        
+
         # Process through body with layer-by-layer NaN checks
         # Specifically fix problematic layers 22 and 23
         for idx, module in enumerate(self.body):
             x = module(x)
-            
+
             # Check for NaNs after each body layer
             if torch.isnan(x).any():
                 print(f"WARNING: Values after body layer {idx} contain NaNs. Replacing with zeros.")
                 x = torch.nan_to_num(x, nan=0.0)
-                
+
             # Apply special handling for layers 22-23 that are causing issues
             if idx in [21, 22, 23]:
                 # Special stabilization for troublesome layers
@@ -405,13 +488,13 @@ class Backbone(Module):
                 if small_values_mask.any():
                     # Set very small non-zero values to a safe minimum to prevent potential division issues
                     x = torch.where(small_values_mask, torch.sign(x) * 1e-6, x)
-                    
+
                 # 2. Check feature norm stability
                 norms = torch.norm(x.view(x.size(0), x.size(1), -1), dim=2)
                 if (norms < 1e-7).any():
                     # Apply channel-wise normalization to prevent collapse
                     x = F.layer_norm(x, [x.size(2), x.size(3)])
-        
+
         # Check for NaNs or zeros in feature maps
         if torch.isnan(x).any() or (torch.sum(x.abs()) < 1e-4):
             print("WARNING: Feature maps contain NaNs or zeros before normalization. Fixing.")
@@ -419,62 +502,42 @@ class Backbone(Module):
             # Apply stable normalization if needed
             if torch.sum(x.abs()) < 1e-4:
                 x = x + 1e-6  # Add small constant to prevent all zeros
-                
-        feature_maps = x  # Store feature maps for QAConv
-        
-        # Generate occlusion confidence map from feature maps
-        # Shape: [B, 1, H, W] where H,W match feature_maps spatial dimensions
-        occlusion_map = self.occlusion_head(feature_maps)
-        
+
+        feature_maps = x  # Store feature maps for QAConv and OcclusionHead
+
         # Check norms of feature maps to ensure they're reasonable
         norms = torch.norm(feature_maps.view(feature_maps.size(0), -1), p=2, dim=1)
         print(f"Feature map norms - min: {norms.min().item():.6f}, max: {norms.max().item():.6f}")
-        
+
+        # Only compute occlusion map when explicitly requested
+        # This prevents unnecessary computation and BatchNorm stat updates on clean images
+        occlusion_map = None
+        if return_occlusion:
+            occlusion_map = self.occlusion_head(feature_maps)  # [B, 1, H', W']
+
         # Get the output embedding
         embedding = self.output_layer(feature_maps)
-        
+
         # Check for NaNs in embeddings
         if torch.isnan(embedding).any():
             print("WARNING: AdaFace embeddings contain NaNs. Replacing with zeros.")
             embedding = torch.nan_to_num(embedding, nan=0.0)
-            
+
         # Safely normalize the final output
         norm = torch.norm(embedding, 2, 1, True).clamp(min=1e-6)  # Clamp to avoid division by zero
         output = torch.div(embedding, norm)
+
+        # Return occlusion maps and feature maps if requested (for training)
+        if return_occlusion:
+            return output, norm, occlusion_map, feature_maps
 
         # QAConv matching score - only return during inference when gallery features are set
         if self.training == False and hasattr(self, '_gallery_features'):
             # Use feature maps directly without normalization to avoid introducing NaNs
             qaconv_score = self.qaconv(feature_maps, self._gallery_features)
-            return output, norm, occlusion_map, qaconv_score
+            return output, norm, qaconv_score
 
-        return output, norm, occlusion_map
-    
-    def get_feature_maps(self, x):
-        """
-        Get feature maps from the backbone for QAConv processing.
-        This is a helper method for accessing intermediate feature representations.
-        
-        Args:
-            x: Input tensor [B, C, H, W]
-            
-        Returns:
-            feature_maps: Feature maps before final embedding layer [B, D, H', W']
-        """
-        # Run through the backbone layers up to feature maps
-        x = self.input_layer(x)
-        x = self.body(x)
-        
-        # Handle potential numerical issues
-        if torch.isnan(x).any():
-            print("WARNING: Feature maps contain NaNs. Replacing with zeros.")
-            x = torch.nan_to_num(x, nan=0.0)
-            
-        # Ensure we don't have all-zero feature maps
-        if torch.sum(x.abs()) < 1e-4:
-            x = x + 1e-6  # Add small constant to prevent all zeros
-            
-        return x
+        return output, norm
 
     def set_gallery_features(self, gallery_features):
         """Store gallery features for QAConv matching"""
